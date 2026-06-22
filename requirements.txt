@@ -10,8 +10,8 @@ scikit-learn==1.5.2
 transformers==4.45.1
 huggingface_hub==0.25.1
 accelerate==0.34.2
-torch==2.4.1
-torchvision==0.19.1
+torch==2.12.1
+torchvision==0.20.1
 mediapipe==0.10.14
 numpy==1.26.4
 matplotlib==3.9.2
