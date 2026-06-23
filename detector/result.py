@@ -86,14 +86,12 @@ class AnalysisResult:
         plt.savefig(path, dpi=130, bbox_inches='tight', facecolor='#0d1117')
         plt.close()
         self.pdf_image(path, width=width, height=height)
-        if important:
-            with open(path, 'rb') as f:
-                b64 = base64.b64encode(f.read()).decode('utf-8')
-            self.payload['graphs'].append({
-                'title'      : title,
-                'description': description,
-                'filename'   : filename,
-            })
+       if important:
+    self.payload['graphs'].append({
+        'title': title,
+        'description': description,
+        'filename': filename,
+    })
         return path
 
     def add_stat(self, label, value):
