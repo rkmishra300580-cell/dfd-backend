@@ -63,13 +63,13 @@ async def analyze_file(file: UploadFile = File(...)):
     print(f'\n[{job_id}] Received: {safe_name} ({len(contents):,} bytes)')
 
     try:
-    print("=== START PIPELINE ===")
-    mem()
+      print("=== START PIPELINE ===")
+      mem()
 
-    result = run_pipeline(tmp_path, job_id)
+      result = run_pipeline(tmp_path, job_id)
 
-    print("=== END PIPELINE ===")
-    mem()
+      print("=== END PIPELINE ===")
+      mem()
 
 finally:
         try: os.remove(tmp_path)
