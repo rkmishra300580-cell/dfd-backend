@@ -5,7 +5,6 @@ Logic unchanged from the validated Colab prototype (Cell 4); only the
 import paths and folder config were adapted for a standalone package.
 """
 import os
-import base64
 from datetime import datetime
 
 import matplotlib
@@ -78,20 +77,23 @@ class AnalysisResult:
         self.elements.append(t)
         self.elements.append(Spacer(1, 10))
 
-    # ── Graph helper — saves fig, encodes to b64, adds to PDF ─
+    # ── Graph helper — saves fig, adds filename ref to payload, adds to PDF ─
     def save_graph(self, filename, title, description='', width=6, height=4, important=True):
         """Save current matplotlib figure.
-        If important=True → also included in frontend JSON response."""
+        If important=True → included in frontend JSON as a filename reference.
+        Frontend fetches each graph via GET /graph/{job_id}/{filename} separately,
+        keeping the main /analyze JSON response small (~5KB instead of ~3.6MB).
+        """
         path = os.path.join(self.tmp_dir, filename)
         plt.savefig(path, dpi=130, bbox_inches='tight', facecolor='#0d1117')
         plt.close()
         self.pdf_image(path, width=width, height=height)
-       if important:
-    self.payload['graphs'].append({
-        'title': title,
-        'description': description,
-        'filename': filename,
-    })
+        if important:
+            self.payload['graphs'].append({
+                'title'      : title,
+                'description': description,
+                'filename'   : filename,
+            })
         return path
 
     def add_stat(self, label, value):
