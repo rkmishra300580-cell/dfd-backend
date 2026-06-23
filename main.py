@@ -54,8 +54,14 @@ async def analyze_file(file: UploadFile = File(...)):
         raise HTTPException(413, 'File too large (max 500MB)')
 
     safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', file.filename or 'upload')
-    job_id    = hashlib.md5(f'{safe_name}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]
-    tmp_path  = os.path.join(TMP_FOLDER, f'{job_id}_{safe_name}')
+    job_id = hashlib.md5(
+        f'{safe_name}{datetime.now().isoformat()}'.encode()
+    ).hexdigest()[:12]
+
+    tmp_path = os.path.join(
+        TMP_FOLDER,
+        f'{job_id}_{safe_name}'
+    )
 
     with open(tmp_path, 'wb') as f:
         f.write(contents)
@@ -63,23 +69,29 @@ async def analyze_file(file: UploadFile = File(...)):
     print(f'\n[{job_id}] Received: {safe_name} ({len(contents):,} bytes)')
 
     try:
-      print("=== START PIPELINE ===")
-      mem()
+        print("=== START PIPELINE ===")
+        mem()
 
-      result = run_pipeline(tmp_path, job_id)
+        result = run_pipeline(tmp_path, job_id)
 
-      print("=== END PIPELINE ===")
-      mem()
+        print("=== END PIPELINE ===")
+        mem()
 
-finally:
-        try: os.remove(tmp_path)
-        except Exception: pass
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
     response_kb = len(str(result)) / 1024
-    print(f'[{job_id}] Response size: {response_kb:.1f} KB  |  graphs: {len(result.get("graphs", []))}')
+
+    print(
+        f'[{job_id}] Response size: '
+        f'{response_kb:.1f} KB  |  '
+        f'graphs: {len(result.get("graphs", []))}'
+    )
 
     return JSONResponse(content=result)
-
 
 @app.get('/graph/{job_id}/{filename}')
 async def get_graph(job_id: str, filename: str):
