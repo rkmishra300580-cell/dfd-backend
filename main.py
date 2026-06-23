@@ -26,6 +26,11 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
+def mem():
+    process = psutil.Process()
+    print(
+        f"MEMORY: {process.memory_info().rss / 1024 / 1024:.1f} MB"
+    )
 
 @app.get('/health')
 async def health():
@@ -58,8 +63,15 @@ async def analyze_file(file: UploadFile = File(...)):
     print(f'\n[{job_id}] Received: {safe_name} ({len(contents):,} bytes)')
 
     try:
-        result = run_pipeline(tmp_path, job_id)
-    finally:
+    print("=== START PIPELINE ===")
+    mem()
+
+    result = run_pipeline(tmp_path, job_id)
+
+    print("=== END PIPELINE ===")
+    mem()
+
+finally:
         try: os.remove(tmp_path)
         except Exception: pass
 
