@@ -8,6 +8,7 @@ import os
 import re
 import hashlib
 from datetime import datetime
+import json
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,6 +65,9 @@ async def analyze_file(file: UploadFile = File(...)):
         try: os.remove(tmp_path)
         except Exception: pass
 
+    
+    response_size = len(json.dumps(result))
+    print(f"RESPONSE SIZE = {response_size/1024:.2f} KB")
     return JSONResponse(content=result)
 
 
