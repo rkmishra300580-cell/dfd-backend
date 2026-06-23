@@ -92,7 +92,6 @@ class AnalysisResult:
             self.payload['graphs'].append({
                 'title'      : title,
                 'description': description,
-                'image_b64'  : b64,
                 'filename'   : filename,
             })
         return path
