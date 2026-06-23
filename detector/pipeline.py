@@ -15,7 +15,14 @@ from .video_pipeline import analyze_video
 from .audio_pipeline import analyze_audio
 from .document_pipeline import analyze_document
 
+import psutil
 
+def mem():
+    process = psutil.Process()
+    print(
+        f"MEMORY: {process.memory_info().rss / 1024 / 1024:.1f} MB"
+    )
+    
 def run_pipeline(filepath: str, job_id: str) -> dict:
     """Main entry point. Returns the JSON payload dict."""
 
@@ -41,10 +48,15 @@ def run_pipeline(filepath: str, job_id: str) -> dict:
         return R.payload
 
     try:
+        print("BEFORE IMAGE PIPELINE")
+        mem()
+
         if   file_type == 'IMAGE'    : final_score = analyze_image(filepath, R)
         elif file_type == 'VIDEO'    : final_score = analyze_video(filepath, R)
         elif file_type == 'AUDIO'    : final_score = analyze_audio(filepath, R)
         elif file_type == 'DOCUMENT' : final_score = analyze_document(filepath, R)
+        print("AFTER IMAGE PIPELINE")
+        mem()
 
         R.payload['final_score']  = round(final_score, 1)
         R.payload['threat_level'] = threat_from_score(final_score)
