@@ -4,7 +4,6 @@ modality-specific analysis function and assembles the final JSON payload.
 Replaces notebook Cell 13 (run_pipeline).
 """
 import os
-import shutil
 import traceback
 from datetime import datetime
 
@@ -66,10 +65,8 @@ def run_pipeline(filepath: str, job_id: str) -> dict:
         R.payload['pdf_ready'] = False
         print(f'PDF build error: {e}')
 
-    # Cleanup per-job tmp files (keep the report PDF)
-    try:
-        shutil.rmtree(R.tmp_dir, ignore_errors=True)
-    except Exception:
-        pass
+    # NOTE: do NOT delete R.tmp_dir here — graph PNG files inside it
+    # are served individually via GET /graph/{job_id}/{filename}.
+    # They will be overwritten naturally on the next job that uses the same job_id.
 
     return R.payload
