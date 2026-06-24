@@ -16,6 +16,19 @@ from transformers import pipeline as hf_pipeline
 from .result import AnalysisResult
 from .helpers import apply_graph_style
 
+# ── Model singleton — loaded once, reused per request.
+# Loading inline per-request caused OOM kills (same pattern as image pipeline).
+_DOC_DETECTOR = None
+
+def _get_doc_detector():
+    global _DOC_DETECTOR
+    if _DOC_DETECTOR is None:
+        _DOC_DETECTOR = hf_pipeline(
+            'text-classification',
+            model='Hello-SimpleAI/chatgpt-detector-roberta'
+        )
+    return _DOC_DETECTOR
+
 
 def analyze_document(filepath, R: AnalysisResult):
     R.pdf_text('DOCUMENT FORENSIC ANALYSIS REPORT', 'Title')
@@ -70,6 +83,7 @@ def analyze_document(filepath, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('doc_linguistics.png', 'Linguistic Analysis',
                  'Word frequency and sentence length distribution. AI-generated text shows unnaturally uniform sentence lengths.', important=True)
+    plt.close(fig)
 
     # TF-IDF
     try:
@@ -82,16 +96,14 @@ def analyze_document(filepath, R: AnalysisResult):
         plt.xticks(rotation=90); plt.tight_layout()
         R.save_graph('doc_tfidf.png', 'TF-IDF Key Terms',
                      'Top key terms by TF-IDF score.', important=True)
+        plt.close(fig)
     except Exception as e:
         R.pdf_text(f'TF-IDF error: {e}')
 
     # AI text detector
     label, confidence = 'UNKNOWN', 50.0
     try:
-        det_pipe = hf_pipeline(
-            'text-classification',
-            model='Hello-SimpleAI/chatgpt-detector-roberta'
-        )
+        det_pipe    = _get_doc_detector()
         chunk_size  = 500
         words_list  = text_content.split()
         chunks      = [' '.join(words_list[i:i+chunk_size]) for i in range(0, len(words_list), chunk_size)]
@@ -140,6 +152,7 @@ def analyze_document(filepath, R: AnalysisResult):
     ax.legend(); plt.tight_layout()
     R.save_graph('doc_dashboard.png', 'AI Detection Dashboard',
                  f'Combined AI detection scores. Final score: {final_score:.1f}%. Label: {label}.', important=True)
+    plt.close(fig)
 
     R.payload['stage_scores']['ai_text_detection']  = round(confidence, 1)
     R.payload['stage_scores']['document_forensics'] = round(final_score, 1)
