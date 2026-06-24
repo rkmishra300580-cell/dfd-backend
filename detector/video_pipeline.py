@@ -60,6 +60,7 @@ def analyze_video(filepath, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('video_frames.png', 'Sampled Frames',
                  'Sampled frames from the video with face detection overlays.', important=True)
+    plt.close(fig)
 
     # FFT per frame
     fft_scores = []
@@ -93,6 +94,7 @@ def analyze_video(filepath, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('video_temporal.png', 'Temporal Analysis',
                  'FFT consistency and frame-to-frame differences. Deepfakes often show unnaturally consistent FFT scores.', important=True)
+    plt.close(fig)
 
     R.add_stat('FFT Std Mean',      f'{np.mean(fft_scores):.2f}')
     R.add_stat('FFT Std Deviation', f'{np.std(fft_scores):.2f}')
