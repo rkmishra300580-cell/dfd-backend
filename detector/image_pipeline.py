@@ -22,6 +22,31 @@ from transformers import pipeline as hf_pipeline
 from .result import AnalysisResult
 from .helpers import detect_faces, extract_fake_score, apply_graph_style
 
+# ── Model singleton — loaded once at import time, reused for every request.
+# Loading inside dl_detector() per-request was the primary cause of OOM on Render Starter (512 MB).
+_DL_DETECTOR = None
+_EFFICIENTNET = None
+
+def _get_dl_detector():
+    global _DL_DETECTOR
+    if _DL_DETECTOR is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        _DL_DETECTOR = hf_pipeline(
+            'image-classification',
+            model='prithivMLmods/Deep-Fake-Detector-v2-Model',
+            device=0 if device == 'cuda' else -1
+        )
+    return _DL_DETECTOR
+
+def _get_efficientnet(device):
+    global _EFFICIENTNET
+    if _EFFICIENTNET is None:
+        weights = EfficientNet_B4_Weights.DEFAULT
+        model   = tv_models.efficientnet_b4(weights=weights).to(device)
+        model.eval()
+        _EFFICIENTNET = (model, weights.transforms())
+    return _EFFICIENTNET
+
 
 # ============================================================
 # STAGE 1 — Frequency Domain Analysis
@@ -63,6 +88,7 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('freq_spectrum.png', 'Frequency Spectrum',
                  'Power spectrum (left) and phase spectrum (right). Synthetic images show unnatural uniformity.', important=True)
+    plt.close(fig)
 
     # Radial average in log domain
     y_idx, x_idx = np.indices(log_power.shape)
@@ -83,6 +109,7 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('radial_decay.png', 'Frequency Decay Profile',
                  'Real camera images show smooth exponential decay. Flat or irregular regions suggest synthetic generation.', important=True)
+    plt.close(fig)
 
     # Band energies
     n         = len(radial_norm)
@@ -109,6 +136,7 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('band_energy.png', 'Frequency Band Energy',
                  'Low/mid/high frequency band energies. Deepfakes often show abnormally weak high-frequency energy.', important=True)
+    plt.close(fig)
 
     if hf_std < 0.1:
         indicators.append('Flattened high-frequency spectrum'); suspicion += 1
@@ -136,6 +164,7 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     plt.suptitle('Per-Channel Frequency Spectra', color='#58a6ff')
     plt.tight_layout()
     R.save_graph('channel_fft.png', 'Per-Channel FFT', important=False)  # PDF only
+    plt.close(fig)
 
     # Noise residual
     blurred      = cv2.GaussianBlur(gray_array, (5,5), 0)
@@ -149,6 +178,7 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('noise_residual.png', 'Noise Residual Map',
                  f'Real cameras produce characteristic noise patterns (std 2–8). Std={residual_std:.2f}. Very low values suggest synthetic origin.', important=True)
+    plt.close(fig)
 
     if residual_std < 4:
         indicators.append('Extremely weak sensor-noise residual'); suspicion += 1
@@ -163,6 +193,7 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     ax.imshow(edge_map, cmap='gray'); ax.set_title('Edge Map', color='#c9d1d9'); ax.axis('off')
     plt.tight_layout()
     R.save_graph('edge_map.png', 'Edge Structure Map', important=False)  # PDF only
+    plt.close(fig)
 
     if edge_density < edge_thresh:
         indicators.append('Artificially smooth edge structure'); suspicion += 1
@@ -209,6 +240,7 @@ def face_forensic_analysis(filepath, pil_image, freq_score, freq_indicators, R: 
     plt.tight_layout()
     R.save_graph('detected_faces.png', 'Face Detection',
                  f'{len(faces)} face(s) detected. Face regions are analysed for warping, blending and resolution inconsistencies.', important=True)
+    plt.close(fig)
 
     if len(faces) == 0:
         R.payload['stage_scores']['face_forensics'] = None
@@ -282,6 +314,7 @@ def face_forensic_analysis(filepath, pil_image, freq_score, freq_indicators, R: 
     plt.tight_layout()
     R.save_graph('face_forensics.png', 'Face Forensic Analysis',
                  f'Edge structure, blur residual, and sharpness comparison. {face_score}/{FACE_TESTS} tests flagged.', important=True)
+    plt.close(fig)
 
     face_probability = (face_score / FACE_TESTS) * 100
     combined         = freq_score * 0.5 + face_probability * 0.5
@@ -308,13 +341,9 @@ def dl_detector(filepath, pil_image, combined_forensic_score, all_indicators,
     fake_score    = 0.0
     matched_label = 'none'
 
-    # Primary: purpose-trained deepfake classifier
+    # Primary: purpose-trained deepfake classifier (singleton — loaded once)
     try:
-        detector  = hf_pipeline(
-            'image-classification',
-            model='prithivMLmods/Deep-Fake-Detector-v2-Model',
-            device=0 if device == 'cuda' else -1
-        )
+        detector  = _get_dl_detector()
         result    = detector(pil_image.convert('RGB'))
         label_map = {r['label']: r['score'] for r in result}
         fake_score, matched_label = extract_fake_score(label_map)
@@ -323,14 +352,11 @@ def dl_detector(filepath, pil_image, combined_forensic_score, all_indicators,
     except Exception as e:
         R.pdf_text(f'Primary DL model failed: {e} — using EfficientNet fallback.')
 
-    # Fallback: EfficientNet-B4 feature variance
+    # Fallback: EfficientNet-B4 feature variance (singleton — loaded once)
     if not dl_available:
         try:
-            weights    = EfficientNet_B4_Weights.DEFAULT
-            model      = tv_models.efficientnet_b4(weights=weights).to(device)
-            model.eval()
-            preprocess = weights.transforms()
-            tensor     = preprocess(pil_image.convert('RGB')).unsqueeze(0).to(device)
+            model, preprocess = _get_efficientnet(device)
+            tensor = preprocess(pil_image.convert('RGB')).unsqueeze(0).to(device)
             with torch.no_grad():
                 feat = model.features(tensor)
             feat_np       = feat.squeeze().cpu().numpy().reshape(-1)
@@ -377,6 +403,7 @@ def dl_detector(filepath, pil_image, combined_forensic_score, all_indicators,
     plt.tight_layout()
     R.save_graph('dl_analysis.png', 'Deep Learning Analysis',
                  f'Attention heatmap and patch variance. DL model confidence: {fake_score:.1f}%.', important=True)
+    plt.close(fig)
 
     # Fusion
     if not freq_reliable:
