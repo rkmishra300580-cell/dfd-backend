@@ -12,8 +12,6 @@ fake-image accuracy from ~12% to 100% in batch validation testing.
 import numpy as np
 import cv2
 import torch
-import torchvision.models as tv_models
-from torchvision.models import EfficientNet_B4_Weights
 from PIL import Image
 from PIL.ExifTags import TAGS
 import matplotlib.pyplot as plt
@@ -25,7 +23,6 @@ from .helpers import detect_faces, extract_fake_score, apply_graph_style
 # ── Model singleton — loaded once at import time, reused for every request.
 # Loading inside dl_detector() per-request was the primary cause of OOM on Render Starter (512 MB).
 _DL_DETECTOR = None
-_EFFICIENTNET = None
 
 def _get_dl_detector():
     global _DL_DETECTOR
@@ -37,15 +34,6 @@ def _get_dl_detector():
             device=0 if device == 'cuda' else -1
         )
     return _DL_DETECTOR
-
-def _get_efficientnet(device):
-    global _EFFICIENTNET
-    if _EFFICIENTNET is None:
-        weights = EfficientNet_B4_Weights.DEFAULT
-        model   = tv_models.efficientnet_b4(weights=weights).to(device)
-        model.eval()
-        _EFFICIENTNET = (model, weights.transforms())
-    return _EFFICIENTNET
 
 
 # ============================================================
@@ -350,23 +338,15 @@ def dl_detector(filepath, pil_image, combined_forensic_score, all_indicators,
         dl_available = True
         R.pdf_text(f'DL model output: {result}')
     except Exception as e:
-        R.pdf_text(f'Primary DL model failed: {e} — using EfficientNet fallback.')
+        R.pdf_text(f'Primary DL model failed: {e} — falling back to forensic score.')
 
-    # Fallback: EfficientNet-B4 feature variance (singleton — loaded once)
+    # Fallback: if primary model fails, use the combined forensic score directly.
+    # EfficientNet-B4 was removed — loading it inline consumed ~200 MB and
+    # contributed to OOM kills on Render Starter.
     if not dl_available:
-        try:
-            model, preprocess = _get_efficientnet(device)
-            tensor = preprocess(pil_image.convert('RGB')).unsqueeze(0).to(device)
-            with torch.no_grad():
-                feat = model.features(tensor)
-            feat_np       = feat.squeeze().cpu().numpy().reshape(-1)
-            feat_variance = float(np.var(feat_np))
-            fake_score    = float(np.clip((1/(1+feat_variance*0.1))*100, 0, 100))
-            matched_label = 'efficientnet-fallback'
-        except Exception as e2:
-            R.pdf_text(f'EfficientNet also failed: {e2}')
-            fake_score = combined_forensic_score
-            matched_label = 'forensic-only'
+        fake_score    = combined_forensic_score
+        matched_label = 'forensic-only'
+        R.pdf_text(f'Primary DL model unavailable — using forensic score as final score.')
 
     R.add_stat('DL Model Score', f'{fake_score:.1f}%')
     R.add_stat('DL Label Matched', matched_label)
