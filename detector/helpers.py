@@ -12,7 +12,6 @@ import mimetypes
 from datetime import datetime
 
 import cv2
-import mediapipe as mp
 import matplotlib.pyplot as plt
 
 
@@ -28,60 +27,17 @@ def file_metadata(filepath):
 
 
 def detect_faces(rgb_array, min_confidence=0.4):
-    """Try MediaPipe tasks API → legacy → OpenCV Haar in order."""
-    h, w = rgb_array.shape[:2]
-
-    # Attempt 1: MediaPipe tasks API (>= 0.10)
-    try:
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision as mp_vision
-        from mediapipe.tasks.python.core import base_options as mp_base
-        import urllib.request
-        model_path = '/tmp/blaze_face_short_range.tflite'
-        if not os.path.exists(model_path):
-            url = ('https://storage.googleapis.com/mediapipe-models/'
-                   'face_detector/blaze_face_short_range/float16/1/'
-                   'blaze_face_short_range.tflite')
-            urllib.request.urlretrieve(url, model_path)
-        base_opts   = mp_base.BaseOptions(model_asset_path=model_path)
-        detect_opts = mp_vision.FaceDetectorOptions(
-            base_options=base_opts, min_detection_confidence=min_confidence)
-        detector = mp_vision.FaceDetector.create_from_options(detect_opts)
-        mp_img   = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_array)
-        result   = detector.detect(mp_img)
-        boxes = []
-        for det in result.detections:
-            bb = det.bounding_box
-            boxes.append((
-                max(0, bb.origin_x), max(0, bb.origin_y),
-                min(bb.width,  w - bb.origin_x),
-                min(bb.height, h - bb.origin_y)
-            ))
-        return boxes
-    except Exception:
-        pass
-
-    # Attempt 2: MediaPipe legacy
-    try:
-        mp_fd = mp.solutions.face_detection
-        with mp_fd.FaceDetection(model_selection=1,
-                                  min_detection_confidence=min_confidence) as det:
-            res = det.process(rgb_array)
-        boxes = []
-        if res and res.detections:
-            for d in res.detections:
-                bb = d.location_data.relative_bounding_box
-                fx = max(0, int(bb.xmin * w)); fy = max(0, int(bb.ymin * h))
-                fw = min(int(bb.width * w), w-fx); fh = min(int(bb.height * h), h-fy)
-                boxes.append((fx, fy, fw, fh))
-        return boxes
-    except Exception:
-        pass
-
-    # Attempt 3: OpenCV Haar
-    gray  = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
-    cc    = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    faces = cc.detectMultiScale(gray, 1.05, 3, minSize=(40, 40))
+    """
+    OpenCV Haar cascade face detector.
+    Mediapipe was removed — it initialised TFLite + EGL on every call,
+    consuming ~150 MB and triggering OOM kills on Render Starter (512 MB).
+    Haar cascade is a plain XML file: negligible memory, no GPU init.
+    The min_confidence parameter is kept for API compatibility but unused
+    (Haar uses fixed thresholds via scaleFactor/minNeighbors).
+    """
+    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+    cc   = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    faces = cc.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40))
     return [(int(x), int(y), int(fw), int(fh)) for (x, y, fw, fh) in faces] if len(faces) > 0 else []
 
 
