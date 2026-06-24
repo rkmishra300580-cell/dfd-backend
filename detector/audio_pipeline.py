@@ -39,6 +39,7 @@ def analyze_audio(filepath, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('audio_waveform_mel.png', 'Waveform & Mel Spectrogram',
                  'Waveform (top) and mel spectrogram (bottom). TTS/voice-cloning often shows uniform energy distribution.', important=True)
+    plt.close(fig)
 
     # Features
     mfcc       = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=20)
@@ -64,6 +65,7 @@ def analyze_audio(filepath, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('audio_mfcc.png', 'MFCC Analysis',
                  f'MFCC coefficients across time. Natural speech shows high variation (std > 15). Current std={mfcc_std:.2f}.', important=True)
+    plt.close(fig)
 
     # Score components
     scores = {
@@ -90,6 +92,7 @@ def analyze_audio(filepath, R: AnalysisResult):
     plt.tight_layout()
     R.save_graph('audio_dashboard.png', 'Audio Forensic Dashboard',
                  'Per-feature suspicion scores. Multiple high scores indicate synthetic/cloned voice.', important=True)
+    plt.close(fig)
 
     indicators = []
     if mfcc_std  < 15:  indicators.append('Low MFCC variance — monotone/synthetic speech')
