@@ -8,7 +8,7 @@ import os
 import re
 import hashlib
 from datetime import datetime
-import psutil
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -26,11 +26,6 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
-def mem():
-    process = psutil.Process()
-    print(
-        f"MEMORY: {process.memory_info().rss / 1024 / 1024:.1f} MB"
-    )
 
 @app.get('/health')
 async def health():
@@ -54,14 +49,8 @@ async def analyze_file(file: UploadFile = File(...)):
         raise HTTPException(413, 'File too large (max 500MB)')
 
     safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', file.filename or 'upload')
-    job_id = hashlib.md5(
-        f'{safe_name}{datetime.now().isoformat()}'.encode()
-    ).hexdigest()[:12]
-
-    tmp_path = os.path.join(
-        TMP_FOLDER,
-        f'{job_id}_{safe_name}'
-    )
+    job_id    = hashlib.md5(f'{safe_name}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]
+    tmp_path  = os.path.join(TMP_FOLDER, f'{job_id}_{safe_name}')
 
     with open(tmp_path, 'wb') as f:
         f.write(contents)
@@ -69,29 +58,16 @@ async def analyze_file(file: UploadFile = File(...)):
     print(f'\n[{job_id}] Received: {safe_name} ({len(contents):,} bytes)')
 
     try:
-        print("=== START PIPELINE ===")
-        mem()
-
         result = run_pipeline(tmp_path, job_id)
-
-        print("=== END PIPELINE ===")
-        mem()
-
     finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        try: os.remove(tmp_path)
+        except Exception: pass
 
     response_kb = len(str(result)) / 1024
-
-    print(
-        f'[{job_id}] Response size: '
-        f'{response_kb:.1f} KB  |  '
-        f'graphs: {len(result.get("graphs", []))}'
-    )
+    print(f'[{job_id}] Response size: {response_kb:.1f} KB  |  graphs: {len(result.get("graphs", []))}')
 
     return JSONResponse(content=result)
+
 
 @app.get('/graph/{job_id}/{filename}')
 async def get_graph(job_id: str, filename: str):
@@ -114,7 +90,7 @@ async def download_report(job_id: str):
     Download the PDF report for a completed job.
     """
     safe_id = re.sub(r'[^A-Za-z0-9]', '', job_id)
-    path    = os.path.join(REPORT_FOLDER, f'report_{safe_id}.pdf')
+    path    = os.path.join(REPORT_FOLDER, f'{safe_id}.pdf')
     if not os.path.exists(path):
         raise HTTPException(404, 'Report not found or expired')
     return FileResponse(
