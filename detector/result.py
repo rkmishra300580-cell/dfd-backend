@@ -207,29 +207,31 @@ class AnalysisResult:
         """Queue a text paragraph for the PDF (original API)."""
         self._pdf_items.append(("text", text, style))
 
-    def save_graph(self, fig, filename: str, caption: str = ""):
-        """
-        Save a matplotlib figure and register it for the PDF.
-        Returns the full file path (original behaviour).
-        """
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+    def add_stat(self, label: str, value):
+        """Append a key/value metric to the stats list (shown in frontend + PDF)."""
+        self.payload["stats"].append({"label": label, "value": str(value)})
 
+    def add_indicator(self, text: str):
+        """Append a flagged indicator string to the indicators list."""
+        self.payload["indicators"].append(text)
+
+    def save_graph(self, filename: str, title: str, description: str = "",
+                   important: bool = True):
+        """
+        Register a graph already saved to disk by the pipeline.
+        Pipelines call plt.close(fig) themselves before calling this.
+
+        Signature matches all pipeline calls:
+            R.save_graph('name.png', 'Title', 'Description', important=True)
+        """
         path = os.path.join(self.graph_dir, filename)
-        fig.savefig(path, dpi=110, bbox_inches="tight", facecolor=fig.get_facecolor())
-        plt.close(fig)
-
-        # Register for PDF
-        cap = caption or os.path.splitext(filename)[0].replace("_", " ").title()
-        self._graphs.append((path, cap))
-
-        # Also add to payload graphs list (for frontend)
-        self.payload["graphs"].append({
-            "title":    cap,
-            "filename": filename,
-            "description": "",
-        })
+        self._graphs.append((path, title))
+        if important:
+            self.payload["graphs"].append({
+                "title":       title,
+                "filename":    filename,
+                "description": description,
+            })
         return path
 
     def build_pdf(self):
