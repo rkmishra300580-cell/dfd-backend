@@ -191,7 +191,7 @@ class AnalysisResult:
 
     def __init__(self, job_id: str):
         self.job_id       = job_id
-        self.payload      = {"job_id": job_id, "graphs": [], "indicators": [], "stats": []}
+        self.payload      = {"job_id": job_id, "graphs": [], "indicators": [], "stats": [], "stage_scores": {}}
         self._pdf_items   = []   # list of (type, content): ('text', ...) or ('graph', path, caption)
         self._graphs      = []   # list of (path, caption) in insertion order
         self._generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
