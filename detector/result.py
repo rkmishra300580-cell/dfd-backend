@@ -1,7 +1,7 @@
 """
 detector/result.py
-Darpan — AnalysisResult + Professional PDF Report Generator
-AlgorivX.AI · Darpan Forensic Engine v5
+Darpan  -  AnalysisResult + Professional PDF Report Generator
+AlgorivX.AI . Darpan Forensic Engine v5
 
 Drop-in replacement: preserves the original AnalysisResult API exactly.
   R = AnalysisResult(job_id)
@@ -24,7 +24,7 @@ from reportlab.lib.utils import ImageReader
 
 from .config import REPORT_FOLDER, TMP_FOLDER
 
-# ── Brand colours ─────────────────────────────────────────────────────────────
+# -- Brand colours -------------------------------------------------------------
 C_DARK       = HexColor("#080c12")
 C_TEAL       = HexColor("#2dd4bf")
 C_WHITE      = HexColor("#ffffff")
@@ -52,7 +52,7 @@ FONT_B = "Helvetica-Bold"
 FONT_R = "Helvetica"
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 def _verdict_color(threat: str):
     t = (threat or "").upper()
     if t in ("MINIMAL", "LOW"):  return C_V_LOW
@@ -117,7 +117,7 @@ def _draw_footer(c, filename, generated_at):
     c.setFont(FONT_R, 6.5)
     y = MARGIN_B + 3
     c.drawString(MARGIN_L, y, f"File analysed: {filename}")
-    c.drawRightString(PAGE_W - MARGIN_R, y, f"Generated: {generated_at}  ·  Confidential — AlgorivX.AI")
+    c.drawRightString(PAGE_W - MARGIN_R, y, f"Generated: {generated_at}  .  Confidential  -  AlgorivX.AI")
 
 
 def _draw_stage_heading(c, y, number, title):
@@ -178,7 +178,7 @@ def _score_bar(c, label, value, x, y, bar_w):
     return y - 8
 
 
-# ── AnalysisResult — preserves original API exactly ───────────────────────────
+# -- AnalysisResult  -  preserves original API exactly ---------------------------
 class AnalysisResult:
     """
     Original API (unchanged):
@@ -201,7 +201,7 @@ class AnalysisResult:
         self.graph_dir    = os.path.join(TMP_FOLDER, job_id)
         os.makedirs(self.graph_dir, exist_ok=True)
 
-    # ── Original methods ──────────────────────────────────────────────────────
+    # -- Original methods ------------------------------------------------------
 
     def pdf_text(self, text: str, style: str = "Normal"):
         """Queue a text paragraph for the PDF (original API)."""
@@ -246,12 +246,12 @@ class AnalysisResult:
         total_pages = self._estimate_pages()
         buf = io.BytesIO()
         c = canvas.Canvas(buf, pagesize=A4)
-        c.setTitle(f"Darpan Forensic Report — {self.job_id}")
-        c.setAuthor("AlgorivX.AI · Darpan Forensic Engine v5")
+        c.setTitle(f"Darpan Forensic Report  -  {self.job_id}")
+        c.setAuthor("AlgorivX.AI . Darpan Forensic Engine v5")
 
         page_num = 1
 
-        # ── PAGE 1: Cover + Summary ───────────────────────────────────────────
+        # -- PAGE 1: Cover + Summary -------------------------------------------
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
@@ -259,12 +259,12 @@ class AnalysisResult:
         c.showPage()
         page_num += 1
 
-        # ── Graph pages by stage ──────────────────────────────────────────────
+        # -- Graph pages by stage ----------------------------------------------
         groups = self._group_graphs()
         for stage_label, items in groups.items():
             page_num = self._draw_graph_section(c, stage_label, items, page_num, total_pages)
 
-        # ── Final Verdict page ────────────────────────────────────────────────
+        # -- Final Verdict page ------------------------------------------------
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
@@ -276,7 +276,7 @@ class AnalysisResult:
         with open(self.report_path, "wb") as f:
             f.write(buf.getvalue())
 
-    # ── Internal PDF builders ─────────────────────────────────────────────────
+    # -- Internal PDF builders -------------------------------------------------
 
     def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename):
         v_col = _verdict_color(threat)
@@ -288,7 +288,7 @@ class AnalysisResult:
 
         c.setFont(FONT_R, 8.5)
         c.setFillColor(C_TEXT_MID)
-        c.drawString(MARGIN_L, content_top - 14, f"{file_type}  ·  {filename}")
+        c.drawString(MARGIN_L, content_top - 14, f"{file_type}  .  {filename}")
 
         c.setStrokeColor(C_TEAL)
         c.setLineWidth(1)
@@ -392,15 +392,15 @@ class AnalysisResult:
     def _group_graphs(self):
         groups = {}
         stage_map = [
-            ("Stage 1 — Frequency Domain Analysis",
+            ("Stage 1  -  Frequency Domain Analysis",
              ["freq", "fft", "power", "phase", "radial", "band", "channel", "noise_residual", "edge"]),
-            ("Stage 2 — Face Forensic Analysis",
+            ("Stage 2  -  Face Forensic Analysis",
              ["face", "blur", "sharpness"]),
-            ("Stage 3 — Manipulation Analysis",
+            ("Stage 3  -  Manipulation Analysis",
              ["ela", "prnu", "patch", "copy", "meta", "manipulation"]),
-            ("Stage 4 — Vehicle & Object Damage Analysis",
+            ("Stage 4  -  Vehicle & Object Damage Analysis",
              ["vehicle", "damage", "shadow", "texture", "boundary", "insurance"]),
-            ("Stage 5 — Deep Learning Detector",
+            ("Stage 5  -  Deep Learning Detector",
              ["dl", "attention", "patch_var", "fusion", "heatmap"]),
         ]
         unclaimed = list(self._graphs)
@@ -432,8 +432,8 @@ class AnalysisResult:
         rows_first  = max(1, int(avail_first / row_h))
         rows_rest   = max(1, int(avail_rest  / row_h))
 
-        parts = stage_label.split("—", 1)
-        num_str   = parts[0].strip().replace("Stage", "").strip() if len(parts) > 1 else "·"
+        parts = stage_label.split(" - ", 1)
+        num_str   = parts[0].strip().replace("Stage", "").strip() if len(parts) > 1 else "."
         title_str = parts[1].strip() if len(parts) > 1 else stage_label
 
         i, first = 0, True
@@ -572,7 +572,7 @@ class AnalysisResult:
         y -= 8
         c.setFont(FONT_R, 6)
         c.setFillColor(C_TEXT_LIGHT)
-        c.drawCentredString(PAGE_W / 2, y, f"AlgorivX.AI · Darpan · {self._generated_at}")
+        c.drawCentredString(PAGE_W / 2, y, f"AlgorivX.AI . Darpan . {self._generated_at}")
 
     def _estimate_pages(self):
         return 1 + max(1, math.ceil(len(self._graphs) / 4)) + 1
