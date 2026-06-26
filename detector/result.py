@@ -22,7 +22,7 @@ from reportlab.lib.colors import HexColor, Color
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-from .config import REPORT_FOLDER, GRAPH_FOLDER   # adjust if your config names differ
+from .config import REPORT_FOLDER, TMP_FOLDER
 
 # ── Brand colours ─────────────────────────────────────────────────────────────
 C_DARK       = HexColor("#080c12")
@@ -198,10 +198,7 @@ class AnalysisResult:
 
         # Derive paths from config
         self.report_path  = os.path.join(REPORT_FOLDER, f"{job_id}.pdf")
-        try:
-            self.graph_dir = os.path.join(GRAPH_FOLDER, job_id)
-        except Exception:
-            self.graph_dir = os.path.join(REPORT_FOLDER, job_id)
+        self.graph_dir    = os.path.join(TMP_FOLDER, job_id)
         os.makedirs(self.graph_dir, exist_ok=True)
 
     # ── Original methods ──────────────────────────────────────────────────────
