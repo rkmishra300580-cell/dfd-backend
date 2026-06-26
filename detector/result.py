@@ -191,7 +191,23 @@ class AnalysisResult:
 
     def __init__(self, job_id: str):
         self.job_id       = job_id
-        self.payload      = {"job_id": job_id, "graphs": [], "indicators": [], "stats": [], "stage_scores": {}}
+        self.payload      = {
+            "job_id": job_id, "graphs": [], "indicators": [], "stats": [], "stage_scores": {},
+            # New REAL / AI_GENERATED / DEEPFAKE taxonomy fields (additive, Phase 1).
+            "classification":        "UNKNOWN",
+            "real_score":            0.0,
+            "ai_generated_score":    0.0,
+            "deepfake_score":        0.0,
+            "confidence":            0.0,
+            "confidence_level":      "LOW",
+            "risk_level":            "LOW",
+            "evidence":              [],
+            "analysis_version":      None,
+            "detectors_used":        [],
+            "successful_detectors":  [],
+            "failed_detectors":      [],
+            "processing_time_ms":    None,
+        }
         self._pdf_items   = []   # list of (type, content): ('text', ...) or ('graph', path, caption)
         self._graphs      = []   # list of (path, caption) in insertion order
         self._generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -218,13 +234,26 @@ class AnalysisResult:
     def save_graph(self, filename: str, title: str, description: str = "",
                    important: bool = True):
         """
-        Register a graph already saved to disk by the pipeline.
-        Pipelines call plt.close(fig) themselves before calling this.
+        Saves the CURRENTLY ACTIVE matplotlib figure to disk and registers it.
 
-        Signature matches all pipeline calls:
+        Every pipeline call site follows the same pattern:
+            fig, ax = plt.subplots(...)
+            ...plotting...
+            R.save_graph('name.png', 'Title', 'Description', important=True)
+            plt.close(fig)
+        So at the moment this runs, plt.gcf() is still that exact figure -
+        nothing has created a new one or closed it yet. This is what was
+        missing before: save_graph only registered a filename string and
+        never actually wrote any PNG bytes to disk, which is why every graph
+        404'd in the frontend and showed "[graph unavailable]" in the PDF.
+
+        Signature matches all existing pipeline calls:
             R.save_graph('name.png', 'Title', 'Description', important=True)
         """
+        import matplotlib.pyplot as plt
         path = os.path.join(self.graph_dir, filename)
+        fig  = plt.gcf()
+        fig.savefig(path, dpi=110, bbox_inches="tight", facecolor=fig.get_facecolor())
         self._graphs.append((path, title))
         if important:
             self.payload["graphs"].append({
