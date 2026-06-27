@@ -47,6 +47,48 @@ def _get_dl_detector():
     return _DL_DETECTOR
 
 
+# -- Second model singleton (Phase 1) - AI-generated-image detector, distinct
+#    task from the deepfake/face-swap detector above. Identical load pattern.
+_DL_AI_DETECTOR = None
+
+def _get_dl_ai_detector():
+    global _DL_AI_DETECTOR
+    if _DL_AI_DETECTOR is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        _DL_AI_DETECTOR = hf_pipeline(
+            'image-classification',
+            model='Organika/sdxl-detector',
+            device=0 if device == 'cuda' else -1
+        )
+    return _DL_AI_DETECTOR
+
+
+def _extract_ai_generated_score(label_map: dict) -> tuple:
+    """
+    Organika/sdxl-detector is a fine-tune of umm-maybe/AI-image-detector,
+    which uses 'artificial' / 'human' labels. Matched generically here
+    (substring, case-insensitive) rather than hardcoding exact casing, since
+    getting this backwards would silently invert every score - the same
+    failure mode extract_fake_score() protects against for the other model.
+
+    NOT YET EMPIRICALLY VALIDATED the way extract_fake_score() was (92.9%
+    on a labeled test set). Test against known AI-generated and known-real
+    images before trusting this score in production.
+    """
+    ai_keys   = [k for k in label_map if any(s in k.lower() for s in ('artificial', 'synthetic', 'fake', 'ai'))]
+    real_keys = [k for k in label_map if any(s in k.lower() for s in ('human', 'real'))]
+
+    if ai_keys:
+        key = ai_keys[0]
+        return label_map[key] * 100, key
+    if real_keys:
+        key = real_keys[0]
+        return (1 - label_map[key]) * 100, key
+
+    # Unrecognized label scheme - surface it loudly instead of guessing.
+    raise ValueError(f'Unrecognized sdxl-detector label scheme: {list(label_map.keys())}')
+
+
 # ============================================================
 # STAGE 1  -  Frequency Domain Analysis
 # ============================================================
@@ -946,26 +988,55 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
     apply_graph_style()
 
     dl_available  = False
-    fake_score    = 0.0
+    dl_deepfake_score = 0.0
     matched_label = 'none'
 
     try:
         detector  = _get_dl_detector()
         result    = detector(pil_image.convert('RGB'))
         label_map = {r['label']: r['score'] for r in result}
-        fake_score, matched_label = extract_fake_score(label_map)
+        dl_deepfake_score, matched_label = extract_fake_score(label_map)
         dl_available = True
-        R.pdf_text(f'DL model output: {result}')
+        R.pdf_text(f'DL deepfake model output: {result}')
     except Exception as e:
         R.pdf_text(f'Primary DL model failed: {e}  -  falling back to forensic score.')
 
     if not dl_available:
-        fake_score    = combined_forensic_score
-        matched_label = 'forensic-only'
+        dl_deepfake_score = combined_forensic_score
+        matched_label     = 'forensic-only'
 
-    R.add_stat('DL Model Score',   f'{fake_score:.1f}%')
-    R.add_stat('DL Label Matched', matched_label)
-    R.payload['stage_scores']['deep_learning'] = round(fake_score, 1)
+    # -- Phase 1: second model, AI-generated-image detector. Additive only -
+    #    does not feed into fusion below in this phase. Graceful degradation:
+    #    if it fails, dl_ai_score stays None and the rest of the pipeline is
+    #    unaffected (nothing downstream currently reads it).
+    dl_ai_available  = False
+    dl_ai_score       = None
+    ai_matched_label = 'none'
+    try:
+        ai_detector  = _get_dl_ai_detector()
+        ai_result    = ai_detector(pil_image.convert('RGB'))
+        ai_label_map = {r['label']: r['score'] for r in ai_result}
+        dl_ai_score, ai_matched_label = _extract_ai_generated_score(ai_label_map)
+        dl_ai_available = True
+        R.pdf_text(f'DL AI-generation model output: {ai_result}')
+    except Exception as e:
+        R.pdf_text(f'Secondary DL (AI-generation) model failed: {e}  -  dl_ai_score unavailable.')
+
+    R.add_stat('DL Deepfake Score', f'{dl_deepfake_score:.1f}%')
+    R.add_stat('DL Deepfake Label', matched_label)
+    R.payload['stage_scores']['deep_learning'] = round(dl_deepfake_score, 1)
+
+    if dl_ai_available:
+        R.add_stat('DL AI-Generated Score', f'{dl_ai_score:.1f}%')
+        R.add_stat('DL AI-Generated Label', ai_matched_label)
+        R.payload['stage_scores']['dl_ai_generated'] = round(dl_ai_score, 1)
+    else:
+        R.add_stat('DL AI-Generated Score', 'Unavailable')
+        R.payload['stage_scores']['dl_ai_generated'] = None
+
+    # Alias - everything below (graph title, fusion math) is unchanged from
+    # before this phase and still reads `fake_score`.
+    fake_score = dl_deepfake_score
 
     img_np  = np.array(pil_image.convert('RGB').resize((380, 380)))
     gray    = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
