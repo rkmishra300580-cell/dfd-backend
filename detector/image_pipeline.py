@@ -21,6 +21,7 @@ Does NOT catch:
 """
 import io
 import os
+import gc
 import numpy as np
 import cv2
 import torch
@@ -32,35 +33,61 @@ from transformers import pipeline as hf_pipeline
 from .result import AnalysisResult
 from .helpers import detect_faces, extract_fake_score, apply_graph_style
 
-# -- Model singleton  -  loaded once, reused every request
-_DL_DETECTOR = None
+# ============================================================================
+# DELIBERATE EXCEPTION to the "all models are permanent singletons" rule
+# from the original project handoff. That rule existed to fix a DIFFERENT
+# problem (constant reload thrash from loading on every single call site
+# scattered through old code). Two image-classification models held
+# permanently resident was found to leave a ~1.5-1.6GB baseline out of a
+# 2GB instance - too little headroom for large-image processing, causing
+# OOM kills (silent process restarts, no Python traceback).
+#
+# Made at explicit user request, prioritizing zero-crash reliability over
+# request latency: each model is loaded, used once, then fully released
+# (del + gc.collect()) BEFORE the next model loads - strictly sequential,
+# never both resident in memory at the same time. This trades a few extra
+# seconds of model-load time per request for a much lower peak memory
+# footprint. Do not "fix" this back to singletons without re-confirming
+# the memory tradeoff with the user first.
+# ============================================================================
 
-def _get_dl_detector():
-    global _DL_DETECTOR
-    if _DL_DETECTOR is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        _DL_DETECTOR = hf_pipeline(
-            'image-classification',
-            model='prithivMLmods/Deep-Fake-Detector-v2-Model',
-            device=0 if device == 'cuda' else -1
-        )
-    return _DL_DETECTOR
+def _run_dl_deepfake_model(pil_image):
+    """Loads prithivMLmods/Deep-Fake-Detector-v2-Model, runs inference once,
+    then fully releases it from memory before returning."""
+    device   = 'cuda' if torch.cuda.is_available() else 'cpu'
+    detector = hf_pipeline(
+        'image-classification',
+        model='prithivMLmods/Deep-Fake-Detector-v2-Model',
+        device=0 if device == 'cuda' else -1
+    )
+    try:
+        result = detector(pil_image.convert('RGB'))
+    finally:
+        del detector
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return result
 
 
-# -- Second model singleton (Phase 1) - AI-generated-image detector, distinct
-#    task from the deepfake/face-swap detector above. Identical load pattern.
-_DL_AI_DETECTOR = None
-
-def _get_dl_ai_detector():
-    global _DL_AI_DETECTOR
-    if _DL_AI_DETECTOR is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        _DL_AI_DETECTOR = hf_pipeline(
-            'image-classification',
-            model='Organika/sdxl-detector',
-            device=0 if device == 'cuda' else -1
-        )
-    return _DL_AI_DETECTOR
+def _run_dl_ai_model(pil_image):
+    """Loads Organika/sdxl-detector, runs inference once, then fully releases
+    it from memory before returning. Only called after
+    _run_dl_deepfake_model() has already flushed - never both resident."""
+    device   = 'cuda' if torch.cuda.is_available() else 'cpu'
+    detector = hf_pipeline(
+        'image-classification',
+        model='Organika/sdxl-detector',
+        device=0 if device == 'cuda' else -1
+    )
+    try:
+        result = detector(pil_image.convert('RGB'))
+    finally:
+        del detector
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return result
 
 
 def _extract_ai_generated_score(label_map: dict) -> tuple:
@@ -992,8 +1019,7 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
     matched_label = 'none'
 
     try:
-        detector  = _get_dl_detector()
-        result    = detector(pil_image.convert('RGB'))
+        result    = _run_dl_deepfake_model(pil_image)  # loads, scores, flushes before returning
         label_map = {r['label']: r['score'] for r in result}
         dl_deepfake_score, matched_label = extract_fake_score(label_map)
         dl_available = True
@@ -1006,15 +1032,16 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
         matched_label     = 'forensic-only'
 
     # -- Phase 1: second model, AI-generated-image detector. Additive only -
-    #    does not feed into fusion below in this phase. Graceful degradation:
-    #    if it fails, dl_ai_score stays None and the rest of the pipeline is
-    #    unaffected (nothing downstream currently reads it).
+    #    does not feed into fusion below in this phase (except the no-face
+    #    branch, see fusion section). Graceful degradation: if it fails,
+    #    dl_ai_score stays None. Loaded only AFTER the deepfake model above
+    #    has already been fully flushed from memory (see function docstrings) -
+    #    the two models are never resident at the same time.
     dl_ai_available  = False
     dl_ai_score       = None
     ai_matched_label = 'none'
     try:
-        ai_detector  = _get_dl_ai_detector()
-        ai_result    = ai_detector(pil_image.convert('RGB'))
+        ai_result    = _run_dl_ai_model(pil_image)  # loads, scores, flushes before returning
         ai_label_map = {r['label']: r['score'] for r in ai_result}
         dl_ai_score, ai_matched_label = _extract_ai_generated_score(ai_label_map)
         dl_ai_available = True
@@ -1076,23 +1103,43 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
     # When no human face is present (vehicle, object), its weight is reduced
     # and vehicle damage score takes a significant share.
     if has_human_face:
-        # Standard human face image
+        # Standard human face image - UNCHANGED from before this fix.
         if not freq_reliable:
             w_forensic, w_manip, w_vehicle, w_dl = 0.15, 0.35, 0.00, 0.50
         else:
             w_forensic, w_manip, w_vehicle, w_dl = 0.25, 0.30, 0.00, 0.45
+        w_dl_ai           = 0.00  # not touched in this fix - see image_pipeline.py history
+        dl_ai_for_fusion  = 0.0
         R.pdf_text('Fusion mode: FACE IMAGE  -  DL model weighted heavily.')
     else:
-        # Vehicle / object image  -  DL model is blind to vehicle damage
-        w_forensic, w_manip, w_vehicle, w_dl = 0.15, 0.30, 0.40, 0.15
-        R.pdf_text('Fusion mode: VEHICLE/OBJECT IMAGE  -  vehicle damage score weighted heavily, DL weight reduced.')
+        # Vehicle / object image. EMERGENCY FIX: dl_ai_score (Phase 1's AI-
+        # generated-image detector) previously had ZERO weight here despite
+        # being the single most relevant signal for non-face content.
+        # Real incident: a ChatGPT-edited vehicle damage photo scored 98.7%
+        # on this signal and the final score still came out 32.4% ("LOW")
+        # because nothing read it. dl_deepfake_score's weight is reduced
+        # (not removed) here since that model is trained for face-swap
+        # detection and is a weaker signal for vehicle/object images.
+        w_forensic, w_manip, w_vehicle, w_dl, w_dl_ai = 0.10, 0.20, 0.30, 0.10, 0.30
+
+        if dl_ai_score is None:
+            # Graceful degradation: redistribute its weight onto vehicle_score
+            # instead of silently zeroing it out.
+            w_vehicle        += w_dl_ai
+            w_dl_ai           = 0.00
+            dl_ai_for_fusion  = 0.0
+        else:
+            dl_ai_for_fusion = dl_ai_score
+
+        R.pdf_text('Fusion mode: VEHICLE/OBJECT IMAGE  -  vehicle damage + AI-generation score weighted heavily, DL deepfake weight reduced.')
         R.add_indicator('[Vehicle] Image contains no human face  -  vehicle damage forensics applied')
 
     final = float(np.clip(
         combined_forensic_score * w_forensic +
         manip_score             * w_manip    +
         vehicle_score           * w_vehicle  +
-        fake_score              * w_dl,
+        fake_score              * w_dl       +
+        dl_ai_for_fusion        * w_dl_ai,
         0, 100
     ))
 
@@ -1118,9 +1165,31 @@ def analyze_image(filepath, R: AnalysisResult):
         pil_raw.seek(0)
     pil_image = pil_raw.convert('RGB')
 
-    R.add_stat('Format',     getattr(pil_raw, 'format', 'unknown'))
-    R.add_stat('Dimensions', f'{pil_image.size[0]} x {pil_image.size[1]} px')
-    R.add_stat('Megapixels', f"{pil_image.size[0]*pil_image.size[1]/1e6:.2f} MP")
+    orig_w, orig_h = pil_image.size
+    R.add_stat('Format',          getattr(pil_raw, 'format', 'unknown'))
+    R.add_stat('Original Dimensions', f'{orig_w} x {orig_h} px')
+    R.add_stat('Original Megapixels', f"{orig_w*orig_h/1e6:.2f} MP")
+
+    # Memory cap: with both DL models loaded, resting baseline is already
+    # ~1.5-1.6GB out of the 2GB instance limit, leaving very little headroom
+    # for per-pixel arrays (FFT, ELA, PRNU, patch analysis all run at full
+    # resolution). A 4K+ photo was observed to OOM-kill the whole process
+    # (silent restart, no catchable exception - that's the signature of a
+    # hard OOM kill, not a Python error). Downscaling here is the fix:
+    # forensic signals (FFT bands, ELA, noise residual, edge structure) are
+    # still meaningful well below native 4K resolution.
+    MAX_DIMENSION = 2048
+    was_downscaled = False
+    if max(orig_w, orig_h) > MAX_DIMENSION:
+        scale = MAX_DIMENSION / max(orig_w, orig_h)
+        new_size = (int(orig_w * scale), int(orig_h * scale))
+        pil_image = pil_image.resize(new_size, Image.LANCZOS)
+        was_downscaled = True
+
+    R.add_stat('Analyzed Dimensions', f'{pil_image.size[0]} x {pil_image.size[1]} px')
+    R.add_stat('Megapixels',          f"{pil_image.size[0]*pil_image.size[1]/1e6:.2f} MP")
+    if was_downscaled:
+        R.add_stat('Downscaled', f'Yes (from {orig_w}x{orig_h}, memory safety cap)')
 
     exif_fields = 0
     try:
