@@ -7,7 +7,7 @@ New in v5.2:
     to produce dominant classification (x% REAL / x% AI_GENERATED / x% DEEPFAKE)
   - Filters indicators to only show those supporting the dominant class
   - All new fields added alongside legacy fields (no breaking changes)
-  - Video, audio, document pipelines: unchange d behaviour
+  - Video, audio, document pipelines: unchanged behaviour
 """
 import os
 import traceback
@@ -16,7 +16,7 @@ from datetime import datetime
 from .config import IMAGE_FORMATS, VIDEO_FORMATS, AUDIO_FORMATS, DOCUMENT_FORMATS, REPORT_FOLDER
 from .result import AnalysisResult
 from .helpers import (
-    file_metadata, threat_from_score, verdict_text,
+    file_metadata,
     classify_dominant, filter_indicators,
 )
 from .image_pipeline    import analyze_image
@@ -58,32 +58,29 @@ def run_pipeline(filepath: str, job_id: str) -> dict:
         elif file_type == 'AUDIO'    : final_score = analyze_audio(filepath, R)
         elif file_type == 'DOCUMENT' : final_score = analyze_document(filepath, R)
 
-        # ── Non-image modalities: legacy behaviour unchanged ──────────────────
-        if file_type != 'IMAGE':
-            R.payload['final_score']  = round(final_score, 1)
-            R.payload['threat_level'] = threat_from_score(final_score)
-            R.payload['verdict']      = verdict_text(final_score)
+        # ── Dominant classification + indicator filtering, all modalities ─────
+        # classify_dominant() dispatches internally by R.payload['file_type']
+        # to the right per-modality composite-score function, then applies
+        # the same shared decision logic / risk_level / legacy mapping /
+        # verdict text regardless of modality.
+        clf = classify_dominant(R.payload)
 
-        # ── IMAGE: dominant classification + indicator filtering ──────────────
-        else:
-            # classify_dominant() reads stage_scores already written by
-            # analyze_image() and returns new fields to merge in.
-            clf = classify_dominant(R.payload)
+        # Preserve raw indicator list for debugging / PDF
+        R.payload['all_indicators'] = list(R.payload.get('indicators', []))
 
-            # Preserve raw indicator list for debugging / PDF
-            R.payload['all_indicators'] = list(R.payload.get('indicators', []))
+        # Filter indicators to only those supporting the dominant class
+        # AND appropriate for the content type (face vs vehicle - has_human_face
+        # defaults to True and is a no-op for audio/document, which never
+        # produce [Face]/[Vehicle]-tagged indicators in the first place).
+        R.payload['indicators'] = filter_indicators(
+            R.payload.get('indicators', []),
+            clf['classification'],
+            has_human_face=R.payload.get('has_human_face', True),
+        )
 
-            # Filter indicators to only those supporting the dominant class
-            # AND appropriate for the content type (face vs vehicle)
-            R.payload['indicators'] = filter_indicators(
-                R.payload.get('indicators', []),
-                clf['classification'],
-                has_human_face=R.payload.get('has_human_face', True),
-            )
-
-            # Merge classification fields into payload
-            # (final_score and threat_level are overwritten with mapped values)
-            R.payload.update(clf)
+        # Merge classification fields into payload
+        # (final_score and threat_level are overwritten with mapped values)
+        R.payload.update(clf)
 
     except Exception as e:
         tb = traceback.format_exc()
