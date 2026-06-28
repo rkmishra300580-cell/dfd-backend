@@ -157,4 +157,20 @@ def analyze_document(filepath, R: AnalysisResult):
     R.payload['stage_scores']['ai_text_detection']  = round(confidence, 1)
     R.payload['stage_scores']['document_forensics'] = round(final_score, 1)
 
+    # Two-track split (mirrors the image pipeline). A document has no
+    # identity to impersonate - "deepfake" isn't a meaningful concept for
+    # text, so document_deepfake_score is hardcoded 0, not computed.
+    R.payload['stage_scores']['document_ai_generated'] = round(final_score, 1)
+    R.payload['stage_scores']['document_deepfake']     = 0.0
+
+    # Same gap found and fixed in the image pipeline: the AI-text-detector
+    # result - often the strongest single signal - previously produced zero
+    # indicator text, only a stat. Without this, indicator filtering would
+    # show an empty "Flagged Indicators" list even on a clearly AI-written
+    # document.
+    if confidence >= 65:
+        R.add_indicator(f'[Document] AI-text detector flagged this content ({label}, confidence={confidence:.1f}%)')
+    if uniformity_score >= 60:
+        R.add_indicator(f'[Document] Unusually uniform sentence lengths (std={float(np.std(sent_lens)) if sent_lens else 0:.1f}) — consistent with AI-generated text')
+
     return float(np.clip(final_score, 0, 100))
