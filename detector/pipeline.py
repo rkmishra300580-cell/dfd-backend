@@ -7,7 +7,7 @@ New in v5.2:
     to produce dominant classification (x% REAL / x% AI_GENERATED / x% DEEPFAKE)
   - Filters indicators to only show those supporting the dominant class
   - All new fields added alongside legacy fields (no breaking changes)
-  - Video, audio, document pipelines: unchanged behaviour
+  - Video, audio, document pipelines: unchange d behaviour
 """
 import os
 import traceback
