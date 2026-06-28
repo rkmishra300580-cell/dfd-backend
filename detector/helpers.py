@@ -30,6 +30,96 @@ DEEPFAKE_THRESHOLD   = 50.0
 AI_GEN_THRESHOLD     = 45.0
 
 
+# ── Per-modality composite score functions ────────────────────────────────────
+# Each returns (deepfake_composite, ai_gen_composite) on a 0-100 scale.
+# classify_dominant() dispatches to the right one by payload['file_type'],
+# then applies the SAME shared decision logic / risk_level / legacy mapping
+# / verdict text regardless of modality - only the composite math differs.
+
+def _compute_image_composites(stage: dict) -> tuple:
+    """Unchanged from the original image-only classify_dominant()."""
+    dl_deepfake  = float(stage.get('deep_learning',   0) or 0)
+    dl_ai        = float(stage.get('dl_ai_generated', 0) or 0)
+    freq         = float(stage.get('frequency',       0) or 0)
+    manip        = float(stage.get('manipulation',    0) or 0)
+    face         = stage.get('face_forensics')    # None when no face
+    vehicle      = stage.get('vehicle_damage')    # None when face present
+    exif_ai      = float(stage.get('exif_ai_score',   0) or 0)
+    exif_real    = float(stage.get('exif_real_score',  0) or 0)
+
+    has_face    = face    is not None
+    has_vehicle = vehicle is not None
+
+    EXIF_CONCLUSIVE_AI   = 70.0
+    EXIF_CONCLUSIVE_REAL = 65.0
+
+    if has_face:
+        deepfake_composite = dl_deepfake * 0.55 + float(face) * 0.30 + manip * 0.15
+    else:
+        deepfake_composite = manip * 0.70 + dl_deepfake * 0.30
+
+    if has_vehicle:
+        ai_gen_composite = dl_ai * 0.30 + freq * 0.20 + float(vehicle) * 0.25 + exif_ai * 0.25
+    else:
+        ai_gen_composite = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
+
+    if exif_ai >= EXIF_CONCLUSIVE_AI:
+        ai_gen_composite = max(ai_gen_composite, exif_ai * 0.90)
+
+    if exif_real >= EXIF_CONCLUSIVE_REAL:
+        suppression_factor = 1.0 - (exif_real - EXIF_CONCLUSIVE_REAL) / 100.0 * 0.6
+        suppression_factor = max(suppression_factor, 0.35)
+        deepfake_composite  *= suppression_factor
+        ai_gen_composite    *= suppression_factor
+
+    return deepfake_composite, ai_gen_composite
+
+
+def _compute_video_composites(stage: dict) -> tuple:
+    """
+    AI-generation track: FFT consistency, temporal stillness, and frame-level
+    ELA are all general synthesis/editing signals that don't require a face.
+    Deepfake track: face-count consistency is the only currently-computed
+    identity-specific signal. It's None (not 0) in stage_scores when no
+    faces ever appeared in the video - treated as 0 contribution here,
+    same "no face, no identity to fake" principle as the image pipeline.
+    """
+    fft   = float(stage.get('video_fft_suspicion',      0) or 0)
+    temp  = float(stage.get('video_temporal_suspicion', 0) or 0)
+    ela   = float(stage.get('video_ela_suspicion',      0) or 0)
+    face  = stage.get('video_face_suspicion')   # None when no faces in any sampled frame
+
+    ai_gen_composite   = fft * 0.45 + temp * 0.35 + ela * 0.20
+    deepfake_composite = float(face) if face is not None else 0.0
+    return deepfake_composite, ai_gen_composite
+
+
+def _compute_audio_composites(stage: dict) -> tuple:
+    """
+    AI-generation track: all five current features (MFCC, spectral flatness,
+    phase irregularity, ZCR, bandwidth) detect synthetic/TTS audio in general.
+    Deepfake track: hardcoded 0. None of the current features verify whether
+    a voice matches a specific target identity - that needs speaker/voice
+    verification, which isn't implemented. Don't change this to a computed
+    heuristic without actually building that capability.
+    """
+    ai_gen_composite   = float(stage.get('audio_ai_generated', stage.get('audio_forensics', 0)) or 0)
+    deepfake_composite = 0.0
+    return deepfake_composite, ai_gen_composite
+
+
+def _compute_document_composites(stage: dict) -> tuple:
+    """
+    AI-generation track: the existing AI-text-detector + entropy + uniformity
+    blend already IS the AI-generation signal.
+    Deepfake track: hardcoded 0. A document has no identity to impersonate -
+    "deepfake" isn't a meaningful concept for text.
+    """
+    ai_gen_composite   = float(stage.get('document_ai_generated', stage.get('document_forensics', 0)) or 0)
+    deepfake_composite = 0.0
+    return deepfake_composite, ai_gen_composite
+
+
 def classify_dominant(payload: dict) -> dict:
     """
     Three-class hierarchical decision engine.
@@ -58,79 +148,14 @@ def classify_dominant(payload: dict) -> dict:
     Dominant score = confidence in the winning class (0-100).
     This is what the frontend shows as the headline number.
     """
-    stage = payload.get('stage_scores', {})
+    stage     = payload.get('stage_scores', {})
+    file_type = payload.get('file_type', 'IMAGE')
 
-    dl_deepfake  = float(stage.get('deep_learning',   0) or 0)
-    dl_ai        = float(stage.get('dl_ai_generated', 0) or 0)
-    freq         = float(stage.get('frequency',       0) or 0)
-    manip        = float(stage.get('manipulation',    0) or 0)
-    face         = stage.get('face_forensics')    # None when no face
-    vehicle      = stage.get('vehicle_damage')    # None when face present
-    exif_ai      = float(stage.get('exif_ai_score',   0) or 0)
-    exif_real    = float(stage.get('exif_real_score',  0) or 0)
-
-    has_face    = face    is not None
-    has_vehicle = vehicle is not None
-
-    # ── EXIF override rules ───────────────────────────────────────────────────
-    # EXIF is the highest-certainty signal we have when it fires conclusively.
-    # An AI generator software tag (exif_ai >= 95) or zero JPEG EXIF
-    # (exif_ai >= 70) should dominate the result — they are near-definitive.
-    # A fully-populated camera EXIF with optics (exif_real >= 65) is a strong
-    # REAL signal that should suppress synthetic classification unless DL model
-    # or manipulation analysis strongly contradicts it.
-    #
-    # Implementation: EXIF scores act as floor/ceiling on composites,
-    # not just additive weights. This prevents a mediocre DL score from
-    # overriding a definitive EXIF finding.
-    EXIF_CONCLUSIVE_AI   = 70.0   # at or above this → treat exif_ai as floor on ai_gen_composite
-    EXIF_CONCLUSIVE_REAL = 65.0   # at or above this → treat exif_real as ceiling suppressor
-
-    # ── Composite deepfake score ──────────────────────────────────────────────
-    if has_face:
-        deepfake_composite = (
-            dl_deepfake  * 0.55 +
-            float(face)  * 0.30 +
-            manip        * 0.15
-        )
-    else:
-        deepfake_composite = manip * 0.70 + dl_deepfake * 0.30
-
-    # ── Composite AI-generation score ─────────────────────────────────────────
-    # EXIF now has explicit weight — previously it was diluted through
-    # manipulation's metadata sub-score at 0.08 * 0.30 = 0.024 effective weight.
-    # Now exif_ai carries 0.30 weight in face mode, 0.25 in vehicle mode.
-    if has_vehicle:
-        ai_gen_composite = (
-            dl_ai          * 0.30 +
-            freq           * 0.20 +
-            float(vehicle) * 0.25 +
-            exif_ai        * 0.25
-        )
-    else:
-        ai_gen_composite = (
-            dl_ai   * 0.40 +
-            freq    * 0.30 +
-            exif_ai * 0.30
-        )
-
-    # ── Apply EXIF floor/ceiling ──────────────────────────────────────────────
-    # If EXIF conclusively signals AI generation, ensure ai_gen_composite
-    # is at least as high as the EXIF score (it cannot be drowned out by
-    # other low-scoring components).
-    if exif_ai >= EXIF_CONCLUSIVE_AI:
-        ai_gen_composite = max(ai_gen_composite, exif_ai * 0.90)
-
-    # If EXIF conclusively confirms a real camera, suppress synthetic composites.
-    # We don't zero them out — DL or manipulation might still be right —
-    # but we cap how high they can go relative to the EXIF real signal.
-    if exif_real >= EXIF_CONCLUSIVE_REAL:
-        suppression_factor = 1.0 - (exif_real - EXIF_CONCLUSIVE_REAL) / 100.0 * 0.6
-        suppression_factor = max(suppression_factor, 0.35)  # never suppress below 35%
-        deepfake_composite  *= suppression_factor
-        ai_gen_composite    *= suppression_factor
-
-    deepfake_composite = float(min(max(deepfake_composite, 0), 100))
+    if   file_type == 'IMAGE'    : deepfake_composite, ai_gen_composite = _compute_image_composites(stage)
+    elif file_type == 'VIDEO'    : deepfake_composite, ai_gen_composite = _compute_video_composites(stage)
+    elif file_type == 'AUDIO'    : deepfake_composite, ai_gen_composite = _compute_audio_composites(stage)
+    elif file_type == 'DOCUMENT' : deepfake_composite, ai_gen_composite = _compute_document_composites(stage)
+    else                         : deepfake_composite, ai_gen_composite = 0.0, 0.0
     ai_gen_composite   = float(min(max(ai_gen_composite,   0), 100))
     synthetic_score    = max(deepfake_composite, ai_gen_composite)
     real_score         = float(max(0, 100 - synthetic_score))
@@ -199,7 +224,8 @@ def classify_dominant(payload: dict) -> dict:
         'final_score':         round(legacy_score, 1),
         'threat_level':        threat_from_score(legacy_score),
         'verdict':             verdict_text_v2(classification, dominant_score,
-                                               deepfake_composite, ai_gen_composite),
+                                               deepfake_composite, ai_gen_composite,
+                                               file_type=file_type),
     }
 
 
@@ -267,6 +293,26 @@ def filter_indicators(indicators: list, classification: str,
         'flattened', 'weak',                      # frequency signals
     ]
 
+    # Modality-specific tag sets, checked SEPARATELY from the image-oriented
+    # ones above. Without this, e.g. video's "[Video] High ELA score on
+    # sampled frames" would get swept into DEEPFAKE_TAGS purely because it
+    # contains the substring "ELA" - which means something different in the
+    # video context (general frame-editing signal, not face-specific) than
+    # it does for images (PRNU/manipulation, face-adjacent). Gating by the
+    # bracket prefix first prevents any cross-modality word collision.
+    VIDEO_DEEPFAKE_TAGS  = ['consistent face count']
+    VIDEO_AI_GEN_TAGS    = ['consistent fft', 'consistent frame fft', 'temporal motion',
+                            'ela score on sampled frames', 'ela on sampled frames']
+    AUDIO_AI_GEN_TAGS    = ['mfcc variance', 'spectral flatness', 'spectral bandwidth',
+                            'low mfcc', 'high spectral', 'narrow spectral']
+    DOCUMENT_AI_GEN_TAGS = ['ai-text detector', 'unusually uniform sentence']
+
+    def _modality(indicator: str) -> str:
+        if indicator.startswith('[Video]'):    return 'VIDEO'
+        if indicator.startswith('[Audio]'):    return 'AUDIO'
+        if indicator.startswith('[Document]'): return 'DOCUMENT'
+        return 'IMAGE'
+
     if classification == 'REAL':
         # For REAL verdicts the indicator list is typically empty after Pass 1.
         # Any remaining indicators are borderline — suppress them all so the
@@ -274,31 +320,57 @@ def filter_indicators(indicators: list, classification: str,
         return []
 
     elif classification == 'DEEPFAKE':
-        return [i for i in indicators if _matches(i, DEEPFAKE_TAGS)]
+        result = []
+        for i in indicators:
+            mod = _modality(i)
+            if   mod == 'VIDEO'                 : keep = _matches(i, VIDEO_DEEPFAKE_TAGS)
+            elif mod in ('AUDIO', 'DOCUMENT')    : keep = False  # no deepfake-track indicators exist for these
+            else                                  : keep = _matches(i, DEEPFAKE_TAGS)
+            if keep: result.append(i)
+        return result
 
     elif classification == 'AI_GENERATED':
-        # For AI_GENERATED: keep frequency/EXIF signals.
         # Also keep manipulation signals that are relevant to AI generation
         # (copy-move, ELA on the whole image — not face-specific ones).
         ai_gen_manip = ['[Manipulation] High ELA', '[Manipulation] Regional ELA',
                         '[Manipulation] [Metadata]', 'copy-move', 'patch inconsistency']
-        return [
-            i for i in indicators
-            if _matches(i, AI_GEN_TAGS) or _matches(i, ai_gen_manip)
-        ]
+        result = []
+        for i in indicators:
+            mod = _modality(i)
+            if   mod == 'VIDEO'    : keep = _matches(i, VIDEO_AI_GEN_TAGS)
+            elif mod == 'AUDIO'    : keep = _matches(i, AUDIO_AI_GEN_TAGS)
+            elif mod == 'DOCUMENT' : keep = _matches(i, DOCUMENT_AI_GEN_TAGS)
+            else                    : keep = _matches(i, AI_GEN_TAGS) or _matches(i, ai_gen_manip)
+            if keep: result.append(i)
+        return result
 
     # Unknown / fallback — return what survived Pass 1
     return indicators
 
 
 def verdict_text_v2(classification: str, dominant_score: float,
-                    deepfake_score: float, ai_gen_score: float) -> str:
+                    deepfake_score: float, ai_gen_score: float,
+                    file_type: str = 'IMAGE') -> str:
     """
     Legally safe verdict language tied to dominant classification.
-    Avoids definitive statements. Uses hedge language appropriate
-    for forensic reports.
+    Avoids definitive statements. Phrasing is modality-aware - "captured by
+    a real camera" doesn't make sense for a document, and image-style
+    "face-swapping" language doesn't fit a cloned voice.
     """
     score_str = f'{dominant_score:.0f}/100'
+
+    DEEPFAKE_PHRASING = {
+        'IMAGE':    'possible face-swapping, identity substitution, or targeted synthetic alteration of authentic source media',
+        'VIDEO':    'possible face-swapping or identity substitution within the video',
+        'AUDIO':    'possible voice cloning or identity-specific audio manipulation',
+        'DOCUMENT': 'targeted alteration of the document content',
+    }
+    AI_GEN_PHRASING = {
+        'IMAGE':    'an AI image generator rather than captured by a real camera',
+        'VIDEO':    'an AI video generation tool, or contains synthetically generated frames, rather than captured by a real camera',
+        'AUDIO':    'speech synthesis or voice generation (TTS) rather than a genuine recording',
+        'DOCUMENT': 'an AI text generation tool rather than written by a human author',
+    }
 
     if classification == 'REAL':
         return (
@@ -307,18 +379,19 @@ def verdict_text_v2(classification: str, dominant_score: float,
             'current forensic analysis.'
         )
     elif classification == 'DEEPFAKE':
+        phrase = DEEPFAKE_PHRASING.get(file_type, DEEPFAKE_PHRASING['IMAGE'])
         return (
             f'Multiple indicators associated with deepfake manipulation were detected '
-            f'(score {score_str}). Analysis suggests possible face-swapping, identity '
-            f'substitution, or targeted synthetic alteration of authentic source media. '
+            f'(score {score_str}). Analysis suggests {phrase}. '
             f'This assessment is based on automated forensic analysis and should be '
             f'verified by a qualified analyst before being used as evidence.'
         )
     elif classification == 'AI_GENERATED':
+        phrase = AI_GEN_PHRASING.get(file_type, AI_GEN_PHRASING['IMAGE'])
         return (
             f'Multiple indicators consistent with AI-generated content were detected '
-            f'(score {score_str}). Analysis suggests this content may have been produced '
-            f'by an AI image generator rather than captured by a real camera. '
+            f'(score {score_str}). Analysis suggests this content may have been produced by '
+            f'{phrase}. '
             f'This assessment is based on automated forensic analysis and should be '
             f'verified by a qualified analyst before being used as evidence.'
         )
