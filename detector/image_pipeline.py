@@ -229,6 +229,7 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     residual     = cv2.absdiff(gray_array, blurred)
     residual_std = float(np.std(residual))
     R.add_stat('Noise Residual Std', f'{residual_std:.2f}')
+    R.payload['stage_scores']['noise_residual_std'] = round(residual_std, 2)
 
     fig, ax = plt.subplots(figsize=(7, 7))
     im = ax.imshow(residual, cmap='hot'); plt.colorbar(im, ax=ax)
@@ -1388,6 +1389,39 @@ def analyze_image(filepath, R: AnalysisResult):
     freq_score, freq_indicators, freq_reliable = frequency_domain_analysis(
         filepath, pil_image, R
     )
+
+    # ── EXIF / pixel-noise cross-validation ─────────────────────────────────
+    # EXIF text fields (Make/Model/GPS/lens optics) are trivially spoofable
+    # with a tool like exiftool - their presence alone was never proof of
+    # camera origin, just an absence-of-evidence-of-tampering signal. A real
+    # camera sensor always has nonzero photon/read noise; AI-generated or
+    # heavily-denoised images often show abnormally clean noise residual.
+    # If EXIF claims a real camera but the pixel noise contradicts that, the
+    # contradiction itself is evidence - this ties two previously-isolated
+    # signals (EXIF, computed first; pixel noise, computed here) together
+    # instead of treating EXIF's claim as independent truth.
+    noise_residual_std = R.payload['stage_scores'].get('noise_residual_std', 999)
+    NOISE_TOO_CLEAN_FOR_REAL_CAMERA = 4.0
+    EXIF_REAL_CLAIM_THRESHOLD       = 50.0
+
+    if (exif_result['exif_real_score'] >= EXIF_REAL_CLAIM_THRESHOLD
+            and noise_residual_std < NOISE_TOO_CLEAN_FOR_REAL_CAMERA):
+        finding = (
+            f'EXIF metadata claims real-camera origin (real score={exif_result["exif_real_score"]:.0f}%), '
+            f'but pixel-level sensor noise is abnormally low (std={noise_residual_std:.2f}, real cameras '
+            f'typically show 2-8) — this contradiction suggests the EXIF data may not reflect the '
+            f"image's true origin"
+        )
+        R.add_indicator(f'[EXIF] {finding}')
+        R.pdf_text(f'EXIF/noise contradiction detected: {finding}')
+
+        # The contradiction itself is evidence of likely spoofing/AI origin -
+        # don't just suppress the real-camera claim, actively raise the
+        # AI-generation signal too.
+        exif_result['exif_real_score'] = min(exif_result['exif_real_score'], 25.0)
+        exif_result['exif_ai_score']   = max(exif_result['exif_ai_score'],   55.0)
+        R.payload['stage_scores']['exif_real_score'] = round(exif_result['exif_real_score'], 1)
+        R.payload['stage_scores']['exif_ai_score']   = round(exif_result['exif_ai_score'],   1)
 
     # Stage 2: Face forensics (returns has_human_face flag)
     combined_score, all_indicators, has_human_face = face_forensic_analysis(
