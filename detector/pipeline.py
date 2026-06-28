@@ -3,7 +3,7 @@ pipeline.py — v5.2
 Main pipeline dispatcher.
 
 New in v5.2:
-  - For IMAGE files: calls classify_dominant() after analyze_image()
+  - For IMAGE files: calls cl assify_dominant() after analyze_image()
     to produce dominant classification (x% REAL / x% AI_GENERATED / x% DEEPFAKE)
   - Filters indicators to only show those supporting the dominant class
   - All new fields added alongside legacy fields (no breaking changes)
