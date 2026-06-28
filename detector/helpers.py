@@ -22,12 +22,19 @@ import matplotlib.pyplot as plt
 
 
 # ── Classification thresholds (tune without code changes) ─────────────────────
-# Synthetic = either deepfake or AI-generated signal is above this
-SYNTHETIC_THRESHOLD  = 35.0
-# When synthetic: deepfake wins if dl_deepfake_score >= this
+# Synthetic = either deepfake or AI-generated signal is above this.
+# 45.0 (raised from 35.0): prevents borderline sdxl-detector false positives
+# on real photographs from triggering AI_GENERATED classification.
+SYNTHETIC_THRESHOLD  = 45.0
+# When synthetic: deepfake wins if deepfake_composite >= this
 DEEPFAKE_THRESHOLD   = 50.0
-# When synthetic: AI_GENERATED wins if dl_ai_score >= this
+# When synthetic: AI_GENERATED wins if ai_gen_composite >= this
 AI_GEN_THRESHOLD     = 45.0
+# DL AI model floor: when sdxl-detector scores >= this, ai_gen_composite is
+# floored at dl_ai * DL_AI_FLOOR_FACTOR so a 99% model score cannot be
+# averaged down to 45% by weaker forensic sub-scores.
+DL_AI_FLOOR_THRESHOLD = 85.0
+DL_AI_FLOOR_FACTOR    = 0.85
 
 
 # ── Per-modality composite score functions ────────────────────────────────────
@@ -59,9 +66,17 @@ def _compute_image_composites(stage: dict) -> tuple:
         deepfake_composite = manip * 0.70 + dl_deepfake * 0.30
 
     if has_vehicle:
-        ai_gen_composite = dl_ai * 0.30 + freq * 0.20 + float(vehicle) * 0.25 + exif_ai * 0.25
+        # dl_ai raised 0.30→0.45: sdxl-detector is the primary signal for
+        # non-face images; at 0.30 a 98% score was being drowned out by
+        # lower-scoring forensic sub-components.
+        ai_gen_composite = dl_ai * 0.45 + freq * 0.20 + float(vehicle) * 0.20 + exif_ai * 0.15
     else:
         ai_gen_composite = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
+
+    # DL AI model floor: when model is very confident (>=85%), don't let
+    # other low-scoring components average it down below dl_ai * 0.85.
+    if dl_ai >= DL_AI_FLOOR_THRESHOLD:
+        ai_gen_composite = max(ai_gen_composite, dl_ai * DL_AI_FLOOR_FACTOR)
 
     if exif_ai >= EXIF_CONCLUSIVE_AI:
         ai_gen_composite = max(ai_gen_composite, exif_ai * 0.90)
@@ -160,8 +175,16 @@ def classify_dominant(payload: dict) -> dict:
     synthetic_score    = max(deepfake_composite, ai_gen_composite)
     real_score         = float(max(0, 100 - synthetic_score))
 
+    # ── Effective threshold: raised when camera EXIF signals present ──────────
+    # exif_real > 0 means some camera metadata exists. A real photo with even
+    # partial camera EXIF needs a stronger synthetic signal to be overridden.
+    # exif_real=15 raises threshold 45→49.5; exif_real=65 raises it to 64.5.
+    # Only applies to IMAGE modality where exif_real is computed.
+    exif_real_for_threshold = float(stage.get('exif_real_score', 0) or 0)
+    effective_threshold = SYNTHETIC_THRESHOLD + exif_real_for_threshold * 0.30
+
     # ── Two-level decision ────────────────────────────────────────────────────
-    if synthetic_score < SYNTHETIC_THRESHOLD:
+    if synthetic_score < effective_threshold:
         classification   = 'REAL'
         dominant_score   = real_score
         dominant_label   = f'{dominant_score:.0f}% REAL'
