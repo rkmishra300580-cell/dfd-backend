@@ -104,4 +104,14 @@ def analyze_audio(filepath, R: AnalysisResult):
     forensic_prob = float(np.clip(np.mean(list(scores.values())), 0, 100))
     R.payload['stage_scores']['audio_forensics'] = round(forensic_prob, 1)
 
+    # Two-track split (mirrors the image pipeline). All five features above
+    # detect synthetic/TTS audio in general - none of them verify whether
+    # the voice matches a specific target identity, so audio_deepfake_score
+    # is an honest placeholder (0), not a computed value. Real voice-clone
+    # detection needs speaker/voice-identity verification, which isn't
+    # implemented. Don't quietly change this to a nonzero heuristic later
+    # without actually building that capability first.
+    R.payload['stage_scores']['audio_ai_generated'] = round(forensic_prob, 1)
+    R.payload['stage_scores']['audio_deepfake']     = 0.0
+
     return forensic_prob
