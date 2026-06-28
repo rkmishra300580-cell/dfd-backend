@@ -175,15 +175,16 @@ def classify_dominant(payload: dict) -> dict:
         risk_level = 'CRITICAL'
 
     # ── Legacy final_score mapping ─────────────────────────────────────────────
-    # Keep final_score populated so existing frontend code doesn't break.
-    # Map: REAL→low, AI_GENERATED→mid, DEEPFAKE→high range
-    if classification == 'REAL':
-        legacy_score = real_score * 0.3          # 0-30 range
-    elif classification == 'AI_GENERATED':
-        legacy_score = 40 + ai_gen_composite * 0.3   # 40-70 range
-    else:  # DEEPFAKE
-        legacy_score = 55 + deepfake_composite * 0.45  # 55-100 range
-    legacy_score = float(min(max(legacy_score, 0), 100))
+    # IMPORTANT: final_score is now set EQUAL to dominant_score, not a separate
+    # remapped value. It was previously computed via a different linear formula
+    # (e.g. `40 + ai_gen_composite * 0.3`), which meant the frontend's headline
+    # number (reading final_score) and the verdict paragraph's embedded score
+    # (reading dominant_score) showed two different numbers for the same
+    # result - e.g. "59% FAKE" headline next to "(score 64/100)" in the verdict
+    # text. There is no old frontend left that needs the old remapped range;
+    # making these the same value by construction is what actually fixes that,
+    # not just narrowing the gap between two still-separate formulas.
+    legacy_score = dominant_score
 
     return {
         # ── New fields (dominant classification) ──────────────────────────────
