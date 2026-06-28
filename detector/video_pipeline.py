@@ -168,6 +168,7 @@ def analyze_video(filepath, R: AnalysisResult):
 
     # ── Face count consistency ────────────────────────────────────
     face_suspicion = 0.0
+    has_faces_in_video = bool(face_counts) and any(c > 0 for c in face_counts)
     if face_counts:
         unique_counts   = len(set(face_counts))
         face_count_mean = float(np.mean(face_counts))
@@ -180,6 +181,7 @@ def analyze_video(filepath, R: AnalysisResult):
 
     R.add_stat('Face Count Variance', f'{len(set(face_counts))} unique values' if face_counts else 'N/A')
     R.add_stat('Face Suspicion',      f'{face_suspicion:.1f}%')
+    R.payload['has_human_face'] = has_faces_in_video
 
     # ── Per-frame ELA ─────────────────────────────────────────────
     # Detects frames that have been individually edited/replaced
@@ -261,6 +263,18 @@ def analyze_video(filepath, R: AnalysisResult):
     R.add_stat('Face Score',      f'{face_suspicion:.1f}%')
     R.add_stat('ELA Score',       f'{ela_suspicion:.1f}%')
     R.add_stat('Final Video Score', f'{final_score:.1f}%')
-    R.payload['stage_scores']['video_temporal'] = round(final_score, 1)
+    R.payload['stage_scores']['video_temporal'] = round(final_score, 1)  # legacy combined key, unchanged
+
+    # New two-track split (mirrors the image pipeline's AI-vs-deepfake split):
+    # FFT consistency / temporal stillness / frame ELA are all general
+    # synthesis-or-editing signals - they don't require a face, so they
+    # feed the AI-generation track. Face-count consistency is the only
+    # currently-computed identity-specific signal, so it's the deepfake
+    # track - and it's None (not 0) when no faces ever appeared in the
+    # video, since there's no identity to fake if there's no face at all.
+    R.payload['stage_scores']['video_fft_suspicion']      = round(fft_suspicion, 1)
+    R.payload['stage_scores']['video_temporal_suspicion'] = round(temporal_suspicion, 1)
+    R.payload['stage_scores']['video_ela_suspicion']       = round(ela_suspicion, 1)
+    R.payload['stage_scores']['video_face_suspicion']      = round(face_suspicion, 1) if has_faces_in_video else None
 
     return final_score
