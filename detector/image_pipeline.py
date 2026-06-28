@@ -1154,6 +1154,193 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
 
 
 # ============================================================
+# EXIF ANALYSIS  -  runs before all other stages
+# Produces two scores fed into classify_dominant() in helpers.py:
+#   exif_ai_score   (0-100): how strongly EXIF signals AI-generation
+#   exif_real_score (0-100): how strongly EXIF confirms authentic camera origin
+#
+# Display policy: only show the user findings that are conclusive.
+# Strong internal signals (camera make/model, GPS, lens optics) are
+# used to influence the score but NOT shown as indicators — if the
+# device ID is wrong the user loses trust in the entire result even
+# if the classification is correct. Conclusive findings (AI generator
+# tag, zero EXIF, thumbnail mismatch) are shown.
+# ============================================================
+def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
+    """
+    Returns dict with keys:
+        exif_ai_score    float 0-100
+        exif_real_score  float 0-100
+        exif_fields      int
+        conclusive_findings  list[str]  — shown to user
+        internal_notes   list[str]      — PDF only, not in indicators
+    """
+    result = {
+        'exif_ai_score':       0.0,
+        'exif_real_score':     0.0,
+        'exif_fields':         0,
+        'conclusive_findings': [],
+        'internal_notes':      [],
+    }
+
+    try:
+        exif_data = pil_raw.getexif() or {}
+        exif_dict = {TAGS.get(k, k): v for k, v in exif_data.items()}
+        result['exif_fields'] = len(exif_dict)
+
+        ai_score   = 0.0
+        real_score = 0.0
+
+        software_tag = str(exif_dict.get('Software', '')).lower()
+
+        # ── CONCLUSIVE AI-generation signals (shown to user) ──────────────────
+
+        # AI generator software tag — near-definitive
+        AI_GEN_TOOLS = ['dall-e', 'midjourney', 'stable diffusion', 'firefly',
+                         'imagen', 'adobe firefly', 'runway', 'bing image',
+                         'canva ai', 'nightcafe', 'leonardo.ai']
+        matched_ai_tool = next((t for t in AI_GEN_TOOLS if t in software_tag), None)
+        if matched_ai_tool:
+            ai_score += 95
+            finding = f'AI generator software identified in metadata: "{exif_dict.get("Software", "")}"'
+            result['conclusive_findings'].append(f'[EXIF] {finding}')
+            R.add_indicator(f'[EXIF] {finding}')
+
+        # Professional editing software (conclusive but with nuance)
+        EDIT_TOOLS = ['photoshop', 'lightroom', 'gimp', 'affinity', 'pixelmator', 'capture one']
+        matched_edit_tool = next((t for t in EDIT_TOOLS if t in software_tag), None)
+        if matched_edit_tool and not matched_ai_tool:
+            ai_score += 45
+            finding = f'Professional editing software in metadata: "{exif_dict.get("Software", "")}" — image has been processed'
+            result['conclusive_findings'].append(f'[EXIF] {finding}')
+            R.add_indicator(f'[EXIF] {finding}')
+
+        # Zero EXIF on a JPEG — JPEGs from real cameras always have EXIF
+        # PNG/WebP from the web legitimately have no EXIF, so only flag JPEG
+        img_format = str(getattr(pil_raw, 'format', '') or '').upper()
+        if len(exif_dict) == 0 and img_format == 'JPEG':
+            ai_score += 70
+            finding = 'No metadata present in this JPEG — authentic camera photos always contain metadata'
+            result['conclusive_findings'].append(f'[EXIF] {finding}')
+            R.add_indicator(f'[EXIF] {finding}')
+        elif len(exif_dict) < 3 and img_format == 'JPEG' and not matched_ai_tool:
+            ai_score += 35
+            finding = f'Minimal metadata ({len(exif_dict)} fields) in JPEG — metadata may have been stripped'
+            result['conclusive_findings'].append(f'[EXIF] {finding}')
+            R.add_indicator(f'[EXIF] {finding}')
+
+        # Thumbnail mismatch — thumbnail embedded in EXIF doesn't match image
+        # This is a specific deepfake/manipulation signal — face swap often
+        # leaves the original thumbnail intact while the main image is replaced
+        try:
+            from PIL.ExifTags import TAGS as _TAGS
+            # ExifThumbnail is stored separately
+            thumb_data = pil_raw.getexif().get_ifd(0x8769)  # ExifIFD
+            if thumb_data:
+                import io as _io
+                thumb_bytes = pil_raw.info.get('exif', b'')
+                if len(thumb_bytes) > 100:
+                    # Quick size check: if thumbnail dimensions don't match
+                    # aspect ratio of main image, that's suspicious
+                    main_ratio = pil_raw.size[0] / max(pil_raw.size[1], 1)
+                    # Can't easily decode thumbnail without full EXIF parse,
+                    # so use presence of PixelXDimension/PixelYDimension mismatch
+                    exif_w = exif_dict.get('PixelXDimension', 0)
+                    exif_h = exif_dict.get('PixelYDimension', 0)
+                    if exif_w and exif_h:
+                        exif_ratio = exif_w / max(exif_h, 1)
+                        if abs(exif_ratio - main_ratio) > 0.15:
+                            ai_score += 30
+                            finding = 'Metadata dimensions do not match image dimensions — possible image replacement'
+                            result['conclusive_findings'].append(f'[EXIF] {finding}')
+                            R.add_indicator(f'[EXIF] {finding}')
+        except Exception:
+            pass  # Thumbnail check is best-effort
+
+        # ── INTERNAL signals (influence score, not shown to user) ─────────────
+
+        has_make     = 'Make' in exif_dict
+        has_model    = 'Model' in exif_dict
+        has_datetime = 'DateTime' in exif_dict or 'DateTimeOriginal' in exif_dict
+        has_gps      = any('GPS' in str(k) for k in exif_dict)
+
+        # Camera optics — AI generators do not produce these
+        # FNumber, ExposureTime, FocalLength, ISOSpeedRatings
+        optics_fields = ['FNumber', 'ExposureTime', 'FocalLength',
+                         'ISOSpeedRatings', 'ShutterSpeedValue', 'ApertureValue',
+                         'BrightnessValue', 'ExposureBiasValue', 'MaxApertureValue',
+                         'MeteringMode', 'Flash', 'FocalLengthIn35mmFilm']
+        optics_present = [f for f in optics_fields if f in exif_dict]
+        n_optics = len(optics_present)
+
+        # Camera make + model = strong REAL signal internally
+        if has_make and has_model:
+            real_score += 30
+            result['internal_notes'].append(
+                f'Camera identified: {exif_dict.get("Make", "")} {exif_dict.get("Model", "")} — internal REAL signal'
+            )
+
+        # Lens optics = strongest REAL signal (AI generators never produce these)
+        if n_optics >= 4:
+            real_score += 35
+            result['internal_notes'].append(
+                f'{n_optics} camera optics fields present (FNumber, exposure, focal length etc) — strong REAL signal'
+            )
+        elif n_optics >= 2:
+            real_score += 18
+            result['internal_notes'].append(
+                f'{n_optics} camera optics fields present — moderate REAL signal'
+            )
+
+        # GPS = real device, real location
+        if has_gps:
+            real_score += 20
+            result['internal_notes'].append('GPS coordinates present — internal REAL signal')
+
+        # Consistent timestamp
+        if has_datetime:
+            real_score += 15
+            result['internal_notes'].append('Timestamp present — internal REAL signal')
+
+        # Make present but DateTime stripped — suspicious pattern
+        if has_make and not has_datetime and not matched_ai_tool:
+            ai_score += 25
+            result['internal_notes'].append('Camera make present but timestamp absent — possible metadata stripping')
+
+        # Adobe ICC without matching editing software
+        icc = pil_raw.info.get('icc_profile')
+        if icc and b'Adobe' in icc and not matched_edit_tool and not matched_ai_tool:
+            ai_score += 20
+            result['internal_notes'].append('Adobe ICC profile without editing software tag — possible metadata manipulation')
+
+        # ── Write to payload + stats ──────────────────────────────────────────
+        result['exif_ai_score']   = float(min(ai_score, 100))
+        result['exif_real_score'] = float(min(real_score, 100))
+
+        # Stats (shown in detailed metrics panel) — raw numbers only, no judgement
+        R.add_stat('EXIF Fields Total',   len(exif_dict))
+        R.add_stat('EXIF Software',       exif_dict.get('Software', 'Not present'))
+        R.add_stat('EXIF Camera',         f'{exif_dict.get("Make","?")} {exif_dict.get("Model","?")}' if has_make else 'Not present')
+        R.add_stat('EXIF Optics Fields',  f'{n_optics}/12')
+        R.add_stat('EXIF GPS',            'Present' if has_gps else 'Absent')
+        R.add_stat('EXIF Timestamp',      'Present' if has_datetime else 'Absent')
+        R.add_stat('EXIF AI Score',       f'{result["exif_ai_score"]:.0f}')
+        R.add_stat('EXIF Real Score',     f'{result["exif_real_score"]:.0f}')
+
+        # PDF only — internal notes for analyst
+        for note in result['internal_notes']:
+            R.pdf_text(f'[EXIF internal] {note}')
+
+        R.payload['stage_scores']['exif_ai_score']   = round(result['exif_ai_score'], 1)
+        R.payload['stage_scores']['exif_real_score'] = round(result['exif_real_score'], 1)
+
+    except Exception as e:
+        R.pdf_text(f'EXIF analysis failed: {e}')
+
+    return result
+
+
+# ============================================================
 # ORCHESTRATOR
 # ============================================================
 def analyze_image(filepath, R: AnalysisResult):
@@ -1191,18 +1378,11 @@ def analyze_image(filepath, R: AnalysisResult):
     if was_downscaled:
         R.add_stat('Downscaled', f'Yes (from {orig_w}x{orig_h}, memory safety cap)')
 
-    exif_fields = 0
-    try:
-        exif_data = pil_raw.getexif()
-        if exif_data:
-            for tag_id, value in exif_data.items():
-                R.pdf_text(f'{TAGS.get(tag_id, tag_id)}: {value}')
-                exif_fields += 1
-    except Exception:
-        pass
-    R.add_stat('EXIF Fields', exif_fields)
-    if exif_fields == 0:
-        R.add_indicator('[EXIF] No EXIF metadata  -  consistent with AI-generated image')
+    # EXIF Analysis — runs before all forensic stages
+    # Produces exif_ai_score and exif_real_score fed into classify_dominant()
+    # Conclusive findings shown to user; internal signals used silently
+    exif_result = exif_analysis(filepath, pil_raw, R)
+    exif_fields = exif_result['exif_fields']
 
     # Stage 1: Frequency analysis
     freq_score, freq_indicators, freq_reliable = frequency_domain_analysis(
@@ -1226,6 +1406,11 @@ def analyze_image(filepath, R: AnalysisResult):
     # for portraits/faces  -  it would otherwise always be a non-null number.
     if has_human_face:
         R.payload['stage_scores'].pop('vehicle_damage', None)
+
+    # Store has_human_face in payload so pipeline.py can use it
+    # for indicator filtering — vehicle/insurance indicators must never
+    # appear when a human face was detected
+    R.payload['has_human_face'] = has_human_face
 
     # Stage 5: DL + adaptive fusion
     final_score = dl_detector(
