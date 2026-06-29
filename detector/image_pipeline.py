@@ -311,15 +311,19 @@ def face_forensic_analysis(filepath, pil_image, freq_score, freq_indicators, R: 
     raw_faces = detect_faces(rgb_image, min_confidence=0.4)
 
     # Filter out false positives from non-face rectangular objects
-    # (licence plates, car grilles etc. trigger Haar on vehicle images)
-    # A human face has aspect ratio close to 1:1 and minimum size
+    # (licence plates, car grilles etc. trigger Haar on vehicle images).
+    # Applied after ALL three cascade passes in detect_faces() so profile-
+    # detected faces pass through the same gate as frontal ones.
+    # Aspect ratio 0.6-1.4: human faces (frontal and profile) are roughly
+    # square; elongated objects (door edges, window frames) that can trigger
+    # the profile cascade tend to have ratios outside this range.
+    # Min area 0.5% of image: rejects tiny spurious hits far from subject.
     h_img, w_img = gray_image.shape
     human_faces  = []
     for (fx, fy, fw, fh) in raw_faces:
         aspect  = fw / max(fh, 1)
         area    = fw * fh
         img_area = h_img * w_img
-        # Human face: aspect ratio 0.6-1.4, area at least 0.5% of image
         if 0.6 <= aspect <= 1.4 and area >= img_area * 0.005:
             human_faces.append((fx, fy, fw, fh))
 
