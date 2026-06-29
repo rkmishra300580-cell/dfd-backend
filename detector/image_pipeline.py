@@ -90,6 +90,31 @@ def _run_dl_ai_model(pil_image):
     return result
 
 
+def _run_dl_ai_model_2(pil_image):
+    """
+    Second AI-generation detector: umm-maybe/AI-image-detector.
+    Trained on a broader range of generators than sdxl-detector
+    (includes DALL-E, Midjourney, Stable Diffusion 1.x/2.x, Firefly).
+    Load-score-flush pattern — never resident with other models.
+    Uses same 'artificial' / 'human' label scheme as sdxl-detector
+    so _extract_ai_generated_score() handles both without modification.
+    """
+    device   = 'cuda' if torch.cuda.is_available() else 'cpu'
+    detector = hf_pipeline(
+        'image-classification',
+        model='umm-maybe/AI-image-detector',
+        device=0 if device == 'cuda' else -1
+    )
+    try:
+        result = detector(pil_image.convert('RGB'))
+    finally:
+        del detector
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return result
+
+
 def _extract_ai_generated_score(label_map: dict) -> tuple:
     """
     Organika/sdxl-detector is a fine-tune of umm-maybe/AI-image-detector,
@@ -1032,23 +1057,46 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
         dl_deepfake_score = combined_forensic_score
         matched_label     = 'forensic-only'
 
-    # -- Phase 1: second model, AI-generated-image detector. Additive only -
-    #    does not feed into fusion below in this phase (except the no-face
-    #    branch, see fusion section). Graceful degradation: if it fails,
-    #    dl_ai_score stays None. Loaded only AFTER the deepfake model above
-    #    has already been fully flushed from memory (see function docstrings) -
-    #    the two models are never resident at the same time.
+    # -- AI-generation ensemble: two models run sequentially, scores averaged.
+    #    Model 1: Organika/sdxl-detector   — fine-tuned on SDXL outputs
+    #    Model 2: umm-maybe/AI-image-detector — broader training (DALL-E,
+    #             Midjourney, SD 1.x/2.x, Firefly, etc.)
+    #    Both use load-score-flush pattern; never resident simultaneously.
+    #    If one fails, the other's score is used alone (graceful degradation).
+    #    If both fail, dl_ai_score stays None and fusion falls back to forensics.
     dl_ai_available  = False
     dl_ai_score       = None
     ai_matched_label = 'none'
+    _ai_scores = []
+
+    # Model 1: sdxl-detector
     try:
-        ai_result    = _run_dl_ai_model(pil_image)  # loads, scores, flushes before returning
-        ai_label_map = {r['label']: r['score'] for r in ai_result}
-        dl_ai_score, ai_matched_label = _extract_ai_generated_score(ai_label_map)
-        dl_ai_available = True
-        R.pdf_text(f'DL AI-generation model output: {ai_result}')
+        ai_result_1    = _run_dl_ai_model(pil_image)
+        ai_label_map_1 = {r['label']: r['score'] for r in ai_result_1}
+        score_1, label_1 = _extract_ai_generated_score(ai_label_map_1)
+        _ai_scores.append(score_1)
+        ai_matched_label = label_1
+        R.pdf_text(f'AI-gen model 1 (sdxl-detector): {ai_result_1}')
     except Exception as e:
-        R.pdf_text(f'Secondary DL (AI-generation) model failed: {e}  -  dl_ai_score unavailable.')
+        R.pdf_text(f'AI-gen model 1 (sdxl-detector) failed: {e}')
+
+    # Model 2: umm-maybe/AI-image-detector (broader training)
+    try:
+        ai_result_2    = _run_dl_ai_model_2(pil_image)
+        ai_label_map_2 = {r['label']: r['score'] for r in ai_result_2}
+        score_2, label_2 = _extract_ai_generated_score(ai_label_map_2)
+        _ai_scores.append(score_2)
+        R.pdf_text(f'AI-gen model 2 (umm-maybe/AI-image-detector): {ai_result_2}')
+        R.add_stat('DL AI-Gen Model 2 Score', f'{score_2:.1f}%')
+    except Exception as e:
+        R.pdf_text(f'AI-gen model 2 (umm-maybe) failed: {e}')
+
+    if _ai_scores:
+        # Average ensemble scores — equal weight, both models validated on same label scheme
+        import statistics
+        dl_ai_score     = float(statistics.mean(_ai_scores))
+        dl_ai_available = True
+        R.add_stat('DL AI-Gen Ensemble Scores', ' / '.join(f'{s:.1f}' for s in _ai_scores))
 
     R.add_stat('DL Deepfake Score', f'{dl_deepfake_score:.1f}%')
     R.add_stat('DL Deepfake Label', matched_label)
@@ -1422,6 +1470,21 @@ def analyze_image(filepath, R: AnalysisResult):
         exif_result['exif_ai_score']   = max(exif_result['exif_ai_score'],   55.0)
         R.payload['stage_scores']['exif_real_score'] = round(exif_result['exif_real_score'], 1)
         R.payload['stage_scores']['exif_ai_score']   = round(exif_result['exif_ai_score'],   1)
+
+    # ── Methodology disclaimer (PDF only) ────────────────────────────────────
+    # Agreed wording (Option 3): frames the EXIF cross-check as standard
+    # forensic-report rigor rather than a standalone weakness admission,
+    # matching the voice already used in verdict_text_v2()'s "should be
+    # verified by a qualified analyst" language. Unconditional - describes
+    # the general methodology, not just cases where the contradiction above
+    # actually fired.
+    R.pdf_text(
+        'Methodology note: Metadata (EXIF) signals in this report are corroborated against '
+        'independent pixel-level sensor-noise analysis rather than accepted at face value, '
+        'reducing — though not eliminating — susceptibility to metadata manipulation. As with '
+        'all findings in this report, EXIF-derived signals should be considered alongside the '
+        'full body of evidence and verified by a qualified analyst.'
+    )
 
     # Stage 2: Face forensics (returns has_human_face flag)
     combined_score, all_indicators, has_human_face = face_forensic_analysis(
