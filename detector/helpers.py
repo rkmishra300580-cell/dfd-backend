@@ -43,7 +43,7 @@ DL_AI_FLOOR_FACTOR    = 0.85
 # then applies the SAME shared decision logic / risk_level / legacy mapping
 # / verdict text regardless of modality - only the composite math differs.
 
-def _compute_image_composites(stage: dict) -> tuple:
+def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
     """Unchanged from the original image-only classify_dominant()."""
     dl_deepfake  = float(stage.get('deep_learning',   0) or 0)
     dl_ai        = float(stage.get('dl_ai_generated', 0) or 0)
@@ -61,7 +61,15 @@ def _compute_image_composites(stage: dict) -> tuple:
     EXIF_CONCLUSIVE_REAL = 65.0
 
     if has_face:
-        deepfake_composite = dl_deepfake * 0.55 + float(face) * 0.30 + manip * 0.15
+        # Weights raised from (0.55/0.30/0.15) → (0.70/0.20/0.10).
+        # Rationale: the DL model (prithivMLmods/Deep-Fake-Detector-v2-Model)
+        # is purpose-trained for face deepfakes and is the authoritative signal.
+        # The Haar face score is a region-quality heuristic, not a deepfake
+        # detector — over-weighting it was diluting a 76.9% DL hit to 59.4%.
+        # Raising DL weight also reduces false-positive risk on real portraits:
+        # when DL correctly scores low (~20%), the composite drops vs before
+        # even if the Haar score is high (e.g. sharp/symmetric face region).
+        deepfake_composite = dl_deepfake * 0.70 + float(face) * 0.20 + manip * 0.10
     else:
         deepfake_composite = manip * 0.70 + dl_deepfake * 0.30
 
@@ -78,7 +86,14 @@ def _compute_image_composites(stage: dict) -> tuple:
     if dl_ai >= DL_AI_FLOOR_THRESHOLD:
         ai_gen_composite = max(ai_gen_composite, dl_ai * DL_AI_FLOOR_FACTOR)
 
-    if exif_ai >= EXIF_CONCLUSIVE_AI:
+    # EXIF conclusive-AI ceiling only applies when there is no human face.
+    # On face images the deepfake DL model is the primary signal; allowing
+    # a 70% EXIF score to floor ai_gen_composite at 63 (70*0.90) can flip
+    # the classification from DEEPFAKE to AI_GENERATED even when the face-
+    # specific deepfake model scored 76.9% — wrong trade-off.
+    # EXIF cannot distinguish face-swap from AI-generated; the face pipeline
+    # can. On non-face images EXIF remains authoritative.
+    if exif_ai >= EXIF_CONCLUSIVE_AI and not has_face:
         ai_gen_composite = max(ai_gen_composite, exif_ai * 0.90)
 
     if exif_real >= EXIF_CONCLUSIVE_REAL:
@@ -166,7 +181,7 @@ def classify_dominant(payload: dict) -> dict:
     stage     = payload.get('stage_scores', {})
     file_type = payload.get('file_type', 'IMAGE')
 
-    if   file_type == 'IMAGE'    : deepfake_composite, ai_gen_composite = _compute_image_composites(stage)
+    if   file_type == 'IMAGE'    : deepfake_composite, ai_gen_composite = _compute_image_composites(stage, has_face=stage.get('face_forensics') is not None)
     elif file_type == 'VIDEO'    : deepfake_composite, ai_gen_composite = _compute_video_composites(stage)
     elif file_type == 'AUDIO'    : deepfake_composite, ai_gen_composite = _compute_audio_composites(stage)
     elif file_type == 'DOCUMENT' : deepfake_composite, ai_gen_composite = _compute_document_composites(stage)
