@@ -456,17 +456,49 @@ def file_metadata(filepath):
 
 def detect_faces(rgb_array, min_confidence=0.4):
     """
-    OpenCV Haar cascade face detector.
-    Mediapipe removed — OOM risk on Render.
-    min_confidence kept for API compat but unused by Haar.
+    Haar cascade face detector — cascade ensemble (three cascades, sequential fallback).
+    Mediapipe removed — OOM risk on Render. min_confidence kept for API compat but unused.
+
+    WHY THREE CASCADES:
+    frontalface_default alone was missing two real failure modes observed in production:
+      1. Tilted/profile faces (chin-up, side-on): frontal cascade by design fails past
+         ~30deg tilt. profileface cascade is trained for this geometry.
+      2. Frontal faces with glasses: glasses reduce orbital-region contrast that
+         frontalface_default's Haar features rely on. frontalface_alt2 uses a
+         different feature set trained differently — catches what default misses.
+
+    STRATEGY: run in order, stop at first non-empty result (do NOT union all three —
+    that multiplies false positives). Each cascade uses the same aspect-ratio filter
+    applied downstream in face_forensic_analysis().
+
+    OOM safety: all three cascades are tiny XML files loaded from disk, no GPU,
+    negligible memory vs the DL models. No change to memory budget.
     """
     gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
-    cc   = cv2.CascadeClassifier(
-        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    )
-    faces = cc.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40))
-    return [(int(x), int(y), int(fw), int(fh)) for (x, y, fw, fh) in faces] \
-        if len(faces) > 0 else []
+
+    def _run(cascade_file, sf, mn, ms):
+        cc = cv2.CascadeClassifier(cv2.data.haarcascades + cascade_file)
+        faces = cc.detectMultiScale(gray, scaleFactor=sf, minNeighbors=mn, minSize=ms)
+        return [(int(x), int(y), int(fw), int(fh)) for (x, y, fw, fh) in faces]             if len(faces) > 0 else []
+
+    # Pass 1: primary frontal cascade — unchanged params, highest precision
+    faces = _run('haarcascade_frontalface_default.xml', sf=1.05, mn=3, ms=(40, 40))
+    if faces:
+        return faces
+
+    # Pass 2: alt2 frontal cascade — different Haar features, catches glasses/partial
+    # occlusion that default misses. Slightly looser (mn=2, ms=30x30) because we
+    # already know default found nothing; sensitivity > precision at this point.
+    faces = _run('haarcascade_frontalface_alt2.xml', sf=1.05, mn=2, ms=(30, 30))
+    if faces:
+        return faces
+
+    # Pass 3: profile cascade — designed for tilted/side-on faces (~90deg).
+    # Only runs when both frontal cascades found nothing. FP risk is real
+    # (elongated objects can trigger it) but is bounded by the aspect-ratio
+    # filter in face_forensic_analysis() and the DL deepfake model's own score.
+    faces = _run('haarcascade_profileface.xml', sf=1.05, mn=2, ms=(30, 30))
+    return faces
 
 
 FAKE_LABEL_VARIANTS = [
