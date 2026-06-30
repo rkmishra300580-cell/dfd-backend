@@ -1,6 +1,6 @@
 """
 helpers.py — v5.2
-Shared helper functions used across all modality pipelines .
+Shared helper functions used across all modality pipelines.
 
 New in v5.2:
   - classify_dominant(): three-class decision engine producing dominant
@@ -81,6 +81,11 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
     face         = stage.get('face_forensics')    # None when no face
     vehicle      = stage.get('vehicle_damage')    # None when face present
     exif_ai      = float(stage.get('exif_ai_score',   0) or 0)
+    # True when exif_ai reached its value via the no-EXIF-corroboration block
+    # borrowing strength from dl_ai_generated/frequency, rather than from
+    # intrinsic EXIF evidence (AI-tool tag, noise contradiction). See gating
+    # below at the EXIF-conclusive ceiling for why this distinction matters.
+    exif_ai_corroborated = bool(stage.get('exif_ai_corroborated', False))
     exif_edit    = float(stage.get('exif_edit_score',  0) or 0)
     exif_real    = float(stage.get('exif_real_score',  0) or 0)
 
@@ -117,14 +122,27 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
         ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
     ai_gen_composite = max(ai_gen_composite, max(ai_gen_components) * COMPOSITE_FLOOR_FACTOR)
 
-    # EXIF conclusive-AI ceiling only applies when there is no human face.
-    # On face images the deepfake DL model is the primary signal; allowing
-    # a 70% EXIF score to floor ai_gen_composite at 63 (70*0.90) can flip
-    # the classification from DEEPFAKE to AI_GENERATED even when the face-
-    # specific deepfake model scored 76.9% — wrong trade-off.
-    # EXIF cannot distinguish face-swap from AI-generated; the face pipeline
-    # can. On non-face images EXIF remains authoritative.
-    if exif_ai >= EXIF_CONCLUSIVE_AI and not has_face:
+    # EXIF conclusive-AI ceiling only applies when there is no human face,
+    # AND when exif_ai reflects intrinsic EXIF evidence (not corroboration-
+    # derived). Two reasons:
+    # 1. (existing) On face images the deepfake DL model is the primary
+    #    signal; allowing a 70% EXIF score to floor ai_gen_composite at 63
+    #    can flip DEEPFAKE->AI_GENERATED even when the face-specific model
+    #    scored 76.9% — wrong trade-off. EXIF can't distinguish face-swap
+    #    from AI-generated; the face pipeline can.
+    # 2. (new) When exif_ai reached 70 via the no-EXIF-corroboration block
+    #    (image_pipeline.py), it got there by borrowing strength from
+    #    dl_ai_generated or frequency — signals already counted directly in
+    #    the weighted ai_gen_composite average above, and already protected
+    #    by COMPOSITE_FLOOR_FACTOR if they're dominant. Applying the EXIF
+    #    ceiling on top double-counts that same signal a second time via a
+    #    different path. Real case: dl_ai=84.4 corroborates exif_ai to 70;
+    #    weighted composite is already 62.4 (dl_ai counted once, correctly);
+    #    the ceiling then pushed it to 63.0 by re-counting dl_ai's influence
+    #    through the EXIF channel. Skipping the ceiling here doesn't lose
+    #    protection — COMPOSITE_FLOOR_FACTOR (0.65 x strongest component)
+    #    already guarantees ai_gen_composite >= dl_ai*0.65 = 54.9 in this case.
+    if exif_ai >= EXIF_CONCLUSIVE_AI and not has_face and not exif_ai_corroborated:
         ai_gen_composite = max(ai_gen_composite, exif_ai * 0.90)
 
     if exif_real >= EXIF_CONCLUSIVE_REAL:
