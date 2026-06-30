@@ -1586,6 +1586,21 @@ def analyze_image(filepath, R: AnalysisResult):
         if corroborated:
             exif_result['exif_ai_score'] = max(exif_result['exif_ai_score'], NO_EXIF_CORROBORATED_AI_SCORE)
             R.payload['stage_scores']['exif_ai_score'] = round(exif_result['exif_ai_score'], 1)
+            # Flag this score as corroboration-derived, not intrinsic EXIF evidence.
+            # WHY: classify_dominant()'s EXIF-conclusive ceiling (exif_ai>=70 -> floor
+            # ai_gen_composite at exif_ai*0.90) was written assuming exif_ai reflects
+            # independent EXIF evidence (AI-tool tag, noise contradiction). Now that
+            # this corroboration block can ALSO push exif_ai to 70 by borrowing
+            # strength from dl_ai_generated, the ceiling double-counts dl_ai: once
+            # directly in the weighted ai_gen_composite average, and again via the
+            # ceiling it indirectly triggered. Real case: dl_ai=84.4 corroborates
+            # exif_ai to 70, weighted composite is already 62.4 (dl_ai counted once,
+            # correctly) - the ceiling then pushed it to 63.0, re-counting dl_ai's
+            # contribution a second time through the back door.
+            # This flag lets classify_dominant() skip the ceiling for corroboration-
+            # derived scores - the COMPOSITE_FLOOR_FACTOR general floor already
+            # protects strong dl_ai/freq signals without this double-count.
+            R.payload['stage_scores']['exif_ai_corroborated'] = True
             R.add_indicator('[EXIF] No-metadata finding corroborated by independent signal(s) - AI-generation signal strengthened')
             R.pdf_text(
                 f'No-EXIF corroboration: dl_ai_generated={dl_ai_for_corroboration}, freq_score={freq_score:.1f} '
