@@ -1,6 +1,6 @@
 """
 helpers.py — v5.2
-Shared helper functions used across all modality pipelines.
+Shared helper functions used across all modality  pipelines.
 
 New in v5.2:
   - classify_dominant(): three-class decision engine producing dominant
