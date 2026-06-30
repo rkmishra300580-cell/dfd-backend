@@ -1592,7 +1592,7 @@ def analyze_image(filepath, R: AnalysisResult):
             # independent EXIF evidence (AI-tool tag, noise contradiction). Now that
             # this corroboration block can ALSO push exif_ai to 70 by borrowing
             # strength from dl_ai_generated, the ceiling double-counts dl_ai: once
-            # directly in the weighted ai_gen_composite average, and again via the
+            # directly in the weighted ai_gen_composite averag e, and again via the
             # ceiling it indirectly triggered. Real case: dl_ai=84.4 corroborates
             # exif_ai to 70, weighted composite is already 62.4 (dl_ai counted once,
             # correctly) - the ceiling then pushed it to 63.0, re-counting dl_ai's
