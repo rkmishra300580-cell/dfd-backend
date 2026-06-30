@@ -311,19 +311,15 @@ def face_forensic_analysis(filepath, pil_image, freq_score, freq_indicators, R: 
     raw_faces = detect_faces(rgb_image, min_confidence=0.4)
 
     # Filter out false positives from non-face rectangular objects
-    # (licence plates, car grilles etc. trigger Haar on vehicle images).
-    # Applied after ALL three cascade passes in detect_faces() so profile-
-    # detected faces pass through the same gate as frontal ones.
-    # Aspect ratio 0.6-1.4: human faces (frontal and profile) are roughly
-    # square; elongated objects (door edges, window frames) that can trigger
-    # the profile cascade tend to have ratios outside this range.
-    # Min area 0.5% of image: rejects tiny spurious hits far from subject.
+    # (licence plates, car grilles etc. trigger Haar on vehicle images)
+    # A human face has aspect ratio close to 1:1 and minimum size
     h_img, w_img = gray_image.shape
     human_faces  = []
     for (fx, fy, fw, fh) in raw_faces:
         aspect  = fw / max(fh, 1)
         area    = fw * fh
         img_area = h_img * w_img
+        # Human face: aspect ratio 0.6-1.4, area at least 0.5% of image
         if 0.6 <= aspect <= 1.4 and area >= img_area * 0.005:
             human_faces.append((fx, fy, fw, fh))
 
@@ -1231,6 +1227,7 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
     result = {
         'exif_ai_score':       0.0,
         'exif_real_score':     0.0,
+        'exif_edit_score':     0.0,   # NEW: editing software signal — separate from AI generation
         'exif_fields':         0,
         'conclusive_findings': [],
         'internal_notes':      [],
@@ -1242,6 +1239,7 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
         result['exif_fields'] = len(exif_dict)
 
         ai_score   = 0.0
+        edit_score = 0.0   # accumulates editing-software signals (separate from AI generation)
         real_score = 0.0
 
         software_tag = str(exif_dict.get('Software', '')).lower()
@@ -1263,7 +1261,11 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
         EDIT_TOOLS = ['photoshop', 'lightroom', 'gimp', 'affinity', 'pixelmator', 'capture one']
         matched_edit_tool = next((t for t in EDIT_TOOLS if t in software_tag), None)
         if matched_edit_tool and not matched_ai_tool:
-            ai_score += 45
+            # Editing software is evidence of EDITING, not AI generation.
+            # Previously this added to ai_score — that caused colour-graded real photos
+            # to be classified as AI_GENERATED. Now routed to edit_score, which feeds
+            # the EDITED classification path in classify_dominant(), not ai_gen_composite.
+            edit_score += 45
             finding = f'Professional editing software in metadata: "{exif_dict.get("Software", "")}" — image has been processed'
             result['conclusive_findings'].append(f'[EXIF] {finding}')
             R.add_indicator(f'[EXIF] {finding}')
@@ -1355,20 +1357,24 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
             real_score += 15
             result['internal_notes'].append('Timestamp present — internal REAL signal')
 
-        # Make present but DateTime stripped — suspicious pattern
+        # Make present but DateTime stripped — suggests metadata was edited/stripped.
+        # This is an editing signal, not an AI-generation signal — route to edit_score.
         if has_make and not has_datetime and not matched_ai_tool:
-            ai_score += 25
-            result['internal_notes'].append('Camera make present but timestamp absent — possible metadata stripping')
+            edit_score += 25
+            result['internal_notes'].append('Camera make present but timestamp absent — possible metadata stripping by editing software')
 
         # Adobe ICC without matching editing software
         icc = pil_raw.info.get('icc_profile')
         if icc and b'Adobe' in icc and not matched_edit_tool and not matched_ai_tool:
-            ai_score += 20
-            result['internal_notes'].append('Adobe ICC profile without editing software tag — possible metadata manipulation')
+            # Adobe ICC without edit tag: likely edited but tag was stripped.
+            # Routed to edit_score, not ai_score — same rationale as editing software above.
+            edit_score += 20
+            result['internal_notes'].append('Adobe ICC profile without editing software tag — possible editing, metadata partially stripped')
 
         # ── Write to payload + stats ──────────────────────────────────────────
-        result['exif_ai_score']   = float(min(ai_score, 100))
+        result['exif_ai_score']   = float(min(ai_score,   100))
         result['exif_real_score'] = float(min(real_score, 100))
+        result['exif_edit_score'] = float(min(edit_score, 100))
 
         # Stats (shown in detailed metrics panel) — raw numbers only, no judgement
         R.add_stat('EXIF Fields Total',   len(exif_dict))
@@ -1378,13 +1384,15 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
         R.add_stat('EXIF GPS',            'Present' if has_gps else 'Absent')
         R.add_stat('EXIF Timestamp',      'Present' if has_datetime else 'Absent')
         R.add_stat('EXIF AI Score',       f'{result["exif_ai_score"]:.0f}')
+        R.add_stat('EXIF Edit Score',     f'{result["exif_edit_score"]:.0f}')
         R.add_stat('EXIF Real Score',     f'{result["exif_real_score"]:.0f}')
 
         # PDF only — internal notes for analyst
         for note in result['internal_notes']:
             R.pdf_text(f'[EXIF internal] {note}')
 
-        R.payload['stage_scores']['exif_ai_score']   = round(result['exif_ai_score'], 1)
+        R.payload['stage_scores']['exif_ai_score']   = round(result['exif_ai_score'],   1)
+        R.payload['stage_scores']['exif_edit_score'] = round(result['exif_edit_score'], 1)
         R.payload['stage_scores']['exif_real_score'] = round(result['exif_real_score'], 1)
 
     except Exception as e:
