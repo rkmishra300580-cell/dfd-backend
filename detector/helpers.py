@@ -26,6 +26,12 @@ import matplotlib.pyplot as plt
 # 45.0 (raised from 35.0): prevents borderline sdxl-detector false positives
 # on real photographs from triggering AI_GENERATED classification.
 SYNTHETIC_THRESHOLD  = 45.0
+# Editing detected: when exif_edit_composite >= this AND classification resolves
+# to REAL, the label becomes 'REAL (Edited)'. Sub-class of REAL — not synthetic.
+# exif_edit=45 (Photoshop tag) alone → 45*0.70=31.5 → stays REAL (correct)
+# exif_edit=45 + manip=30 → 31.5+9=40.5 → REAL (Edited)
+# exif_edit=70 (stripped+ICC) alone → 49 → REAL (Edited)
+EDITED_THRESHOLD     = 40.0
 # When synthetic: deepfake wins if deepfake_composite >= this
 DEEPFAKE_THRESHOLD   = 50.0
 # When synthetic: AI_GENERATED wins if ai_gen_composite >= this
@@ -52,6 +58,7 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
     face         = stage.get('face_forensics')    # None when no face
     vehicle      = stage.get('vehicle_damage')    # None when face present
     exif_ai      = float(stage.get('exif_ai_score',   0) or 0)
+    exif_edit    = float(stage.get('exif_edit_score',  0) or 0)
     exif_real    = float(stage.get('exif_real_score',  0) or 0)
 
     has_face    = face    is not None
@@ -102,7 +109,11 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
         deepfake_composite  *= suppression_factor
         ai_gen_composite    *= suppression_factor
 
-    return deepfake_composite, ai_gen_composite
+    # edit_composite: editing software tag (0.70) + forensic manipulation (0.30).
+    # A colour-grade alone won't fire ELA/PRNU, so exif_edit carries it solo.
+    edit_composite = float(min(max(exif_edit * 0.70 + manip * 0.30, 0), 100))
+
+    return deepfake_composite, ai_gen_composite, edit_composite
 
 
 def _compute_video_composites(stage: dict) -> tuple:
@@ -121,7 +132,7 @@ def _compute_video_composites(stage: dict) -> tuple:
 
     ai_gen_composite   = fft * 0.45 + temp * 0.35 + ela * 0.20
     deepfake_composite = float(face) if face is not None else 0.0
-    return deepfake_composite, ai_gen_composite
+    return deepfake_composite, ai_gen_composite, 0.0  # edit_composite N/A for video
 
 
 def _compute_audio_composites(stage: dict) -> tuple:
@@ -135,7 +146,7 @@ def _compute_audio_composites(stage: dict) -> tuple:
     """
     ai_gen_composite   = float(stage.get('audio_ai_generated', stage.get('audio_forensics', 0)) or 0)
     deepfake_composite = 0.0
-    return deepfake_composite, ai_gen_composite
+    return deepfake_composite, ai_gen_composite, 0.0  # edit_composite N/A for audio
 
 
 def _compute_document_composites(stage: dict) -> tuple:
@@ -147,7 +158,7 @@ def _compute_document_composites(stage: dict) -> tuple:
     """
     ai_gen_composite   = float(stage.get('document_ai_generated', stage.get('document_forensics', 0)) or 0)
     deepfake_composite = 0.0
-    return deepfake_composite, ai_gen_composite
+    return deepfake_composite, ai_gen_composite, 0.0  # edit_composite N/A for documents
 
 
 def classify_dominant(payload: dict) -> dict:
@@ -181,13 +192,14 @@ def classify_dominant(payload: dict) -> dict:
     stage     = payload.get('stage_scores', {})
     file_type = payload.get('file_type', 'IMAGE')
 
-    if   file_type == 'IMAGE'    : deepfake_composite, ai_gen_composite = _compute_image_composites(stage, has_face=stage.get('face_forensics') is not None)
-    elif file_type == 'VIDEO'    : deepfake_composite, ai_gen_composite = _compute_video_composites(stage)
-    elif file_type == 'AUDIO'    : deepfake_composite, ai_gen_composite = _compute_audio_composites(stage)
-    elif file_type == 'DOCUMENT' : deepfake_composite, ai_gen_composite = _compute_document_composites(stage)
-    else                         : deepfake_composite, ai_gen_composite = 0.0, 0.0
+    if   file_type == 'IMAGE'    : deepfake_composite, ai_gen_composite, edit_composite = _compute_image_composites(stage, has_face=stage.get('face_forensics') is not None)
+    elif file_type == 'VIDEO'    : deepfake_composite, ai_gen_composite, edit_composite = _compute_video_composites(stage)
+    elif file_type == 'AUDIO'    : deepfake_composite, ai_gen_composite, edit_composite = _compute_audio_composites(stage)
+    elif file_type == 'DOCUMENT' : deepfake_composite, ai_gen_composite, edit_composite = _compute_document_composites(stage)
+    else                         : deepfake_composite, ai_gen_composite, edit_composite = 0.0, 0.0, 0.0
     ai_gen_composite   = float(min(max(ai_gen_composite,   0), 100))
-    synthetic_score    = max(deepfake_composite, ai_gen_composite)
+    edit_composite     = float(min(max(edit_composite,      0), 100))
+    synthetic_score    = max(deepfake_composite, ai_gen_composite)  # edit is sub-REAL, not synthetic
     real_score         = float(max(0, 100 - synthetic_score))
 
     # ── Effective threshold: raised when camera EXIF signals present ──────────
@@ -202,17 +214,25 @@ def classify_dominant(payload: dict) -> dict:
     if synthetic_score < effective_threshold:
         classification   = 'REAL'
         dominant_score   = real_score
-        dominant_label   = f'{dominant_score:.0f}% REAL'
+        # Sub-classification: was the image edited even if not synthetically generated?
+        # editing_detected is set here and carried in the return dict.
+        # The frontend uses it to display 'REAL (Edited)' instead of plain 'REAL'.
+        # Threshold is conservative: requires editing software tag + some forensic
+        # corroboration, so a bare Photoshop tag on an untouched export stays 'REAL'.
+        editing_detected = (edit_composite >= EDITED_THRESHOLD)
+        dominant_label   = f'{dominant_score:.0f}% REAL (Edited)' if editing_detected else f'{dominant_score:.0f}% REAL'
 
     elif deepfake_composite >= DEEPFAKE_THRESHOLD and deepfake_composite >= ai_gen_composite:
         classification   = 'DEEPFAKE'
         dominant_score   = deepfake_composite
         dominant_label   = f'{dominant_score:.0f}% DEEPFAKE'
+        editing_detected = False
 
     elif ai_gen_composite >= AI_GEN_THRESHOLD:
         classification   = 'AI_GENERATED'
         dominant_score   = ai_gen_composite
         dominant_label   = f'{dominant_score:.0f}% AI GENERATED'
+        editing_detected = False
 
     else:
         # Synthetic signal present but neither track is dominant enough
@@ -223,7 +243,8 @@ def classify_dominant(payload: dict) -> dict:
         else:
             classification = 'AI_GENERATED'
             dominant_score = ai_gen_composite
-        dominant_label = f'{dominant_score:.0f}% {classification.replace("_", " ")} (low confidence)'
+        dominant_label   = f'{dominant_score:.0f}% {classification.replace("_", " ")} (low confidence)'
+        editing_detected = False
 
     # ── Risk level ────────────────────────────────────────────────────────────
     if classification == 'REAL':
@@ -253,17 +274,20 @@ def classify_dominant(payload: dict) -> dict:
         # ── New fields (dominant classification) ──────────────────────────────
         'classification':      classification,
         'dominant_score':      round(dominant_score, 1),
-        'dominant_label':      dominant_label,      # e.g. "78% DEEPFAKE"
+        'dominant_label':      dominant_label,      # e.g. "78% DEEPFAKE" or "92% REAL (Edited)"
         'real_score':          round(real_score, 1),
         'ai_generated_score':  round(ai_gen_composite, 1),
         'deepfake_score':      round(deepfake_composite, 1),
+        'edited_score':        round(edit_composite, 1),   # NEW: editing signal strength
+        'editing_detected':    editing_detected,           # NEW: True → show 'REAL (Edited)'
         'risk_level':          risk_level,
         # ── Updated legacy fields ─────────────────────────────────────────────
         'final_score':         round(legacy_score, 1),
         'threat_level':        threat_from_score(legacy_score),
         'verdict':             verdict_text_v2(classification, dominant_score,
                                                deepfake_composite, ai_gen_composite,
-                                               file_type=file_type),
+                                               file_type=file_type,
+                                               editing_detected=editing_detected),
     }
 
 
@@ -382,18 +406,32 @@ def filter_indicators(indicators: list, classification: str,
             if keep: result.append(i)
         return result
 
+    elif classification == 'REAL':
+        # When editing_detected=True the classification is still 'REAL' — keep
+        # EXIF editing indicators and manipulation forensics. Drop AI-gen and
+        # deepfake-specific signals so they don't confuse the user.
+        EDITED_TAGS = ['[EXIF]', '[Manipulation]', 'editing software',
+                       'ELA', 'PRNU', 'copy-move', 'patch', 'metadata']
+        # If no editing indicators exist (plain REAL), this returns [] per
+        # the existing REAL branch above — this branch is only reached for
+        # REAL (Edited) where indicators survived Pass 1.
+        result = [i for i in indicators if _matches(i, EDITED_TAGS)]
+        return result
+
     # Unknown / fallback — return what survived Pass 1
     return indicators
 
 
 def verdict_text_v2(classification: str, dominant_score: float,
                     deepfake_score: float, ai_gen_score: float,
-                    file_type: str = 'IMAGE') -> str:
+                    file_type: str = 'IMAGE',
+                    editing_detected: bool = False) -> str:
     """
     Legally safe verdict language tied to dominant classification.
     Avoids definitive statements. Phrasing is modality-aware - "captured by
     a real camera" doesn't make sense for a document, and image-style
     "face-swapping" language doesn't fit a cloned voice.
+    editing_detected=True produces 'REAL (Edited)' language when classification=REAL.
     """
     score_str = f'{dominant_score:.0f}/100'
 
@@ -411,6 +449,15 @@ def verdict_text_v2(classification: str, dominant_score: float,
     }
 
     if classification == 'REAL':
+        if editing_detected:
+            return (
+                'Content appears to originate from a genuine source, but forensic '
+                'analysis detected evidence of professional editing or post-processing. '
+                'The underlying image is not assessed as AI-generated or deepfake. '
+                'Edits may include colour grading, retouching, cropping, or other '
+                'common photo-editing workflows. This does not indicate fabrication '
+                'or synthetic generation.'
+            )
         return (
             'No significant indicators of synthetic manipulation were detected. '
             'Content appears consistent with authentic, unedited media under '
@@ -456,49 +503,17 @@ def file_metadata(filepath):
 
 def detect_faces(rgb_array, min_confidence=0.4):
     """
-    Haar cascade face detector — cascade ensemble (three cascades, sequential fallback).
-    Mediapipe removed — OOM risk on Render. min_confidence kept for API compat but unused.
-
-    WHY THREE CASCADES:
-    frontalface_default alone was missing two real failure modes observed in production:
-      1. Tilted/profile faces (chin-up, side-on): frontal cascade by design fails past
-         ~30deg tilt. profileface cascade is trained for this geometry.
-      2. Frontal faces with glasses: glasses reduce orbital-region contrast that
-         frontalface_default's Haar features rely on. frontalface_alt2 uses a
-         different feature set trained differently — catches what default misses.
-
-    STRATEGY: run in order, stop at first non-empty result (do NOT union all three —
-    that multiplies false positives). Each cascade uses the same aspect-ratio filter
-    applied downstream in face_forensic_analysis().
-
-    OOM safety: all three cascades are tiny XML files loaded from disk, no GPU,
-    negligible memory vs the DL models. No change to memory budget.
+    OpenCV Haar cascade face detector.
+    Mediapipe removed — OOM risk on Render.
+    min_confidence kept for API compat but unused by Haar.
     """
     gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
-
-    def _run(cascade_file, sf, mn, ms):
-        cc = cv2.CascadeClassifier(cv2.data.haarcascades + cascade_file)
-        faces = cc.detectMultiScale(gray, scaleFactor=sf, minNeighbors=mn, minSize=ms)
-        return [(int(x), int(y), int(fw), int(fh)) for (x, y, fw, fh) in faces]             if len(faces) > 0 else []
-
-    # Pass 1: primary frontal cascade — unchanged params, highest precision
-    faces = _run('haarcascade_frontalface_default.xml', sf=1.05, mn=3, ms=(40, 40))
-    if faces:
-        return faces
-
-    # Pass 2: alt2 frontal cascade — different Haar features, catches glasses/partial
-    # occlusion that default misses. Slightly looser (mn=2, ms=30x30) because we
-    # already know default found nothing; sensitivity > precision at this point.
-    faces = _run('haarcascade_frontalface_alt2.xml', sf=1.05, mn=2, ms=(30, 30))
-    if faces:
-        return faces
-
-    # Pass 3: profile cascade — designed for tilted/side-on faces (~90deg).
-    # Only runs when both frontal cascades found nothing. FP risk is real
-    # (elongated objects can trigger it) but is bounded by the aspect-ratio
-    # filter in face_forensic_analysis() and the DL deepfake model's own score.
-    faces = _run('haarcascade_profileface.xml', sf=1.05, mn=2, ms=(30, 30))
-    return faces
+    cc   = cv2.CascadeClassifier(
+        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    )
+    faces = cc.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40))
+    return [(int(x), int(y), int(fw), int(fh)) for (x, y, fw, fh) in faces] \
+        if len(faces) > 0 else []
 
 
 FAKE_LABEL_VARIANTS = [
