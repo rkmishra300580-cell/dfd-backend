@@ -36,11 +36,24 @@ EDITED_THRESHOLD     = 40.0
 DEEPFAKE_THRESHOLD   = 50.0
 # When synthetic: AI_GENERATED wins if ai_gen_composite >= this
 AI_GEN_THRESHOLD     = 45.0
-# DL AI model floor: when sdxl-detector scores >= this, ai_gen_composite is
-# floored at dl_ai * DL_AI_FLOOR_FACTOR so a 99% model score cannot be
-# averaged down to 45% by weaker forensic sub-scores.
-DL_AI_FLOOR_THRESHOLD = 85.0
-DL_AI_FLOOR_FACTOR    = 0.85
+# DL AI model floor: replaced 2026-06-29. The narrow check below
+# (`dl_ai >= 85.0`) missed a real production case where dl_ai_generated=84.4 -
+# 0.6 points short of the threshold - and got zero floor protection as a
+# result. Replaced with a general floor applied to BOTH composites, based on
+# whichever component is actually strongest, not a fixed score-specific check.
+#
+# Factor tuned 2026-06-29 via sensitivity sweep against two real cases from a
+# Hive comparison: a genuine deepfake (DL=72.2%, correctly stayed DEEPFAKE at
+# every floor tested) and a real photo the DL models misread (dl_ai=67.2%,
+# falsely became AI_GENERATED at floor>=0.70 given AI_GEN_THRESHOLD=45). 0.65
+# is the lowest value where the deepfake case's score is unaffected (plateaus
+# at 0.85 and below — the floor stops being the binding constraint past that
+# point) while the false-positive case correctly returns to REAL. Do not
+# raise this back toward 0.85 without re-running both cases against the
+# REAL classify_dominant() function and its actual thresholds (not an
+# approximation) — an earlier sweep using an assumed 50-point threshold
+# instead of the real 45-point AI_GEN_THRESHOLD wrongly suggested 0.70.
+COMPOSITE_FLOOR_FACTOR = 0.65
 
 
 # ── Per-modality composite score functions ────────────────────────────────────
@@ -50,7 +63,17 @@ DL_AI_FLOOR_FACTOR    = 0.85
 # / verdict text regardless of modality - only the composite math differs.
 
 def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
-    """Unchanged from the original image-only classify_dominant()."""
+    """
+    Each composite uses max(weighted_average, COMPOSITE_FLOOR_FACTOR *
+    strongest_single_component) - a general dominant-signal floor so one
+    strong, specific finding can't get diluted below its own significance by
+    weaker, unrelated corroborating signals. Applies to BOTH tracks, in
+    BOTH branches (face/no-face, vehicle/no-vehicle) - whichever component
+    is strongest sets the floor, regardless of which one it happens to be.
+    This replaces an earlier version that only floored ai_gen_composite, and
+    only when dl_ai >= 85 specifically - a real case with dl_ai=84.4 fell
+    just short of that threshold and got no protection at all.
+    """
     dl_deepfake  = float(stage.get('deep_learning',   0) or 0)
     dl_ai        = float(stage.get('dl_ai_generated', 0) or 0)
     freq         = float(stage.get('frequency',       0) or 0)
@@ -76,22 +99,23 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
         # Raising DL weight also reduces false-positive risk on real portraits:
         # when DL correctly scores low (~20%), the composite drops vs before
         # even if the Haar score is high (e.g. sharp/symmetric face region).
-        deepfake_composite = dl_deepfake * 0.70 + float(face) * 0.20 + manip * 0.10
+        deepfake_components = [dl_deepfake, float(face)]
+        deepfake_composite  = dl_deepfake * 0.70 + float(face) * 0.20 + manip * 0.10
     else:
-        deepfake_composite = manip * 0.70 + dl_deepfake * 0.30
+        deepfake_components = [manip, dl_deepfake]
+        deepfake_composite  = manip * 0.70 + dl_deepfake * 0.30
+    deepfake_composite = max(deepfake_composite, max(deepfake_components) * COMPOSITE_FLOOR_FACTOR)
 
     if has_vehicle:
         # dl_ai raised 0.30→0.45: sdxl-detector is the primary signal for
         # non-face images; at 0.30 a 98% score was being drowned out by
         # lower-scoring forensic sub-components.
-        ai_gen_composite = dl_ai * 0.45 + freq * 0.20 + float(vehicle) * 0.20 + exif_ai * 0.15
+        ai_gen_components = [dl_ai, freq, float(vehicle), exif_ai]
+        ai_gen_composite  = dl_ai * 0.45 + freq * 0.20 + float(vehicle) * 0.20 + exif_ai * 0.15
     else:
-        ai_gen_composite = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
-
-    # DL AI model floor: when model is very confident (>=85%), don't let
-    # other low-scoring components average it down below dl_ai * 0.85.
-    if dl_ai >= DL_AI_FLOOR_THRESHOLD:
-        ai_gen_composite = max(ai_gen_composite, dl_ai * DL_AI_FLOOR_FACTOR)
+        ai_gen_components = [dl_ai, freq, exif_ai]
+        ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
+    ai_gen_composite = max(ai_gen_composite, max(ai_gen_components) * COMPOSITE_FLOOR_FACTOR)
 
     # EXIF conclusive-AI ceiling only applies when there is no human face.
     # On face images the deepfake DL model is the primary signal; allowing
@@ -120,6 +144,7 @@ def _compute_video_composites(stage: dict) -> tuple:
     """
     AI-generation track: FFT consistency, temporal stillness, and frame-level
     ELA are all general synthesis/editing signals that don't require a face.
+    Same general dominant-signal floor as the image composites.
     Deepfake track: face-count consistency is the only currently-computed
     identity-specific signal. It's None (not 0) in stage_scores when no
     faces ever appeared in the video - treated as 0 contribution here,
@@ -131,6 +156,7 @@ def _compute_video_composites(stage: dict) -> tuple:
     face  = stage.get('video_face_suspicion')   # None when no faces in any sampled frame
 
     ai_gen_composite   = fft * 0.45 + temp * 0.35 + ela * 0.20
+    ai_gen_composite   = max(ai_gen_composite, max(fft, temp, ela) * COMPOSITE_FLOOR_FACTOR)
     deepfake_composite = float(face) if face is not None else 0.0
     return deepfake_composite, ai_gen_composite, 0.0  # edit_composite N/A for video
 
