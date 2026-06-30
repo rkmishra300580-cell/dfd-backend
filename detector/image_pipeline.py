@@ -1231,6 +1231,8 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
         'exif_fields':         0,
         'conclusive_findings': [],
         'internal_notes':      [],
+        'exif_no_metadata_flagged': False,  # NEW: set True if the no/minimal-EXIF signal fired,
+                                             # so analyze_image() knows whether to check for corroboration
     }
 
     try:
@@ -1270,19 +1272,40 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
             result['conclusive_findings'].append(f'[EXIF] {finding}')
             R.add_indicator(f'[EXIF] {finding}')
 
-        # Zero EXIF on a JPEG — JPEGs from real cameras always have EXIF
-        # PNG/WebP from the web legitimately have no EXIF, so only flag JPEG
+        # Zero EXIF on a JPEG — JPEGs from real cameras always have EXIF,
+        # BUT this is genuinely ambiguous on its own: messaging apps
+        # (WhatsApp, Telegram, Signal) strip ALL EXIF on send by default,
+        # as do many phone camera apps for privacy, and so do simple re-saves.
+        # A photo transmitted via WhatsApp (filenames like
+        # "PHOTO-2026-06-24-17-09-00.jpg" are a strong tell) will have zero
+        # EXIF regardless of whether it's a real photo or AI-generated.
+        # Real case: a genuine shirt-colour-edited photo with dl_ai_generated
+        # at 0.9% (pixel models confidently said "not AI-generated") still
+        # got pushed to 63% AI_GENERATED, driven almost entirely by this
+        # single unconditional +70.
+        #
+        # Fix: this signal alone now only contributes a reduced base score.
+        # PNG/WebP from the web legitimately have no EXIF, so only flag JPEG.
+        # The score is boosted back up later, in analyze_image(), but ONLY
+        # if corroborated by another independent signal (elevated dl_ai_
+        # generated, or frequency/noise signals also flagging) — see the
+        # "no-EXIF corroboration" block after frequency analysis runs.
+        # 'exif_no_metadata_flagged' lets that later block find this finding.
         img_format = str(getattr(pil_raw, 'format', '') or '').upper()
         if len(exif_dict) == 0 and img_format == 'JPEG':
-            ai_score += 70
-            finding = 'No metadata present in this JPEG — authentic camera photos always contain metadata'
+            ai_score += 25  # reduced base score — was an unconditional 70
+            finding = 'No metadata present in this JPEG — ambiguous on its own (common with messaging-app transmission); see corroboration check'
             result['conclusive_findings'].append(f'[EXIF] {finding}')
             R.add_indicator(f'[EXIF] {finding}')
+            result['exif_no_metadata_flagged'] = True
         elif len(exif_dict) < 3 and img_format == 'JPEG' and not matched_ai_tool:
-            ai_score += 35
-            finding = f'Minimal metadata ({len(exif_dict)} fields) in JPEG — metadata may have been stripped'
+            ai_score += 15  # reduced base score — was an unconditional 35, same rationale
+            finding = f'Minimal metadata ({len(exif_dict)} fields) in JPEG — metadata may have been stripped (ambiguous alone)'
             result['conclusive_findings'].append(f'[EXIF] {finding}')
             R.add_indicator(f'[EXIF] {finding}')
+            result['exif_no_metadata_flagged'] = True
+        else:
+            result['exif_no_metadata_flagged'] = False
 
         # Thumbnail mismatch — thumbnail embedded in EXIF doesn't match image
         # This is a specific deepfake/manipulation signal — face swap often
@@ -1526,5 +1549,53 @@ def analyze_image(filepath, R: AnalysisResult):
         filepath, pil_image, combined_score, manip_score,
         vehicle_score, has_human_face, all_indicators, freq_reliable, R
     )
+
+    # ── No-EXIF corroboration check ─────────────────────────────────────────
+    # The "no/minimal EXIF metadata" finding in exif_analysis() now only
+    # contributes a reduced base score on its own (was an unconditional +70,
+    # which is too strong given how common innocent EXIF-stripping is —
+    # messaging apps, many phone camera apps, and simple re-saves all strip
+    # EXIF regardless of whether the image is real or AI-generated). Real
+    # case this was built from: a genuine shirt-colour-edited photo with
+    # dl_ai_generated=0.9% (pixel model confidently said "not AI-generated")
+    # still got pushed to 63% AI_GENERATED almost entirely by an unconditional
+    # no-EXIF signal.
+    #
+    # This block runs LAST, after every other stage, because corroboration
+    # needs frequency/noise (available after Stage 1) AND dl_ai_generated
+    # (only available after dl_detector() above, the very last stage) -
+    # exif_analysis() itself runs FIRST and has none of these yet.
+    #
+    # Corroboration sources (any one is enough to apply the boost):
+    #   - dl_ai_generated also elevated (the pixel model agrees something's off)
+    #   - frequency score also elevated (spectral anomalies independently flagged)
+    #   - the EXIF/noise contradiction above already fired (exif_ai_score >= 55
+    #     from that block means pixel noise already contradicted a real-camera claim)
+    if exif_result.get('exif_no_metadata_flagged'):
+        dl_ai_for_corroboration = R.payload['stage_scores'].get('dl_ai_generated')
+        CORROBORATION_DL_AI_THRESHOLD  = 40.0
+        CORROBORATION_FREQ_THRESHOLD   = 55.0
+        NO_EXIF_CORROBORATED_AI_SCORE  = 70.0  # restores the original strength, but only when earned
+
+        corroborated = (
+            (dl_ai_for_corroboration is not None and dl_ai_for_corroboration >= CORROBORATION_DL_AI_THRESHOLD)
+            or freq_score >= CORROBORATION_FREQ_THRESHOLD
+            or exif_result['exif_ai_score'] >= 55.0  # the noise-contradiction block already fired
+        )
+
+        if corroborated:
+            exif_result['exif_ai_score'] = max(exif_result['exif_ai_score'], NO_EXIF_CORROBORATED_AI_SCORE)
+            R.payload['stage_scores']['exif_ai_score'] = round(exif_result['exif_ai_score'], 1)
+            R.add_indicator('[EXIF] No-metadata finding corroborated by independent signal(s) - AI-generation signal strengthened')
+            R.pdf_text(
+                f'No-EXIF corroboration: dl_ai_generated={dl_ai_for_corroboration}, freq_score={freq_score:.1f} '
+                f'- at least one independent signal supports the no-metadata finding, so its contribution was restored.'
+            )
+        else:
+            R.pdf_text(
+                f'No-EXIF finding NOT corroborated by other signals (dl_ai_generated={dl_ai_for_corroboration}, '
+                f'freq_score={freq_score:.1f}) - kept at reduced strength to avoid over-penalizing images with '
+                f'innocently-stripped metadata (e.g. messaging-app transmission).'
+            )
 
     return final_score
