@@ -1595,7 +1595,7 @@ def analyze_image(filepath, R: AnalysisResult):
             # directly in the weighted ai_gen_composite averag e, and again via the
             # ceiling it indirectly triggered. Real case: dl_ai=84.4 corroborates
             # exif_ai to 70, weighted composite is already 62.4 (dl_ai counted once,
-            # correctly) - the ceiling then pushed it to 63.0,  re-counting dl_ai's
+            # correctly) - the ceiling then pushed it to 63.0, re-counting dl_ai's
             # contribution a second time through the back door.
             # This flag lets classify_dominant() skip the ceiling for corroboration-
             # derived scores - the COMPOSITE_FLOOR_FACTOR general floor already
