@@ -178,6 +178,68 @@ def _score_bar(c, label, value, x, y, bar_w):
     return y - 8
 
 
+# -- Detailed Metrics: category mapping + plain-language summaries ---------------
+STAT_CATEGORIES = [
+    ("Image Pattern Analysis",  "\u25A6",
+     ["band energy", "hf std", "spectral entropy", "noise residual",
+      "edge density", "frequency score", "frequency suspicion"],
+     "frequency", "frequency patterns consistent with AI generation"),
+    ("Face Analysis",            "\u25C9",
+     ["face forensic", "human faces", "raw detections"],
+     "face_forensics", "face-swap or synthetic-face indicators"),
+    ("Editing Traces",           "\u2735",
+     ["ela ", "ela score", "copy-move", "noise cv", "noise range",
+      "patch outlier", "patch score", "metadata score",
+      "manipulation score", "prnu"],
+     "manipulation", "cloning, splicing, or retouching"),
+    ("Vehicle & Damage Analysis","\u26A0",
+     ["damage", "shadow", "texture", "boundary", "insurance"],
+     "vehicle_damage", "inconsistencies in the damage region"),
+    ("Deep Learning Detectors",  "\u25C6",
+     ["dl ai-gen", "dl deepfake", "dl score", "fusion", "forensic score"],
+     "deep_learning", "AI-generation or face-swap signatures"),
+    ("Photo Metadata (EXIF)",    "\u2387",
+     ["exif", "gps", "timestamp", "device in exif", "software tag", "camera make"],
+     "exif_ai_score", "metadata inconsistent with a genuine camera photo"),
+    ("File Information",         "\u25A3",
+     ["format", "dimensions", "megapixels", "downscaled"],
+     None, None),
+]
+
+def _categorize_stats(stats, stage_scores):
+    buckets = {title: [] for title, *_ in STAT_CATEGORIES}
+    unclaimed = []
+    for stat in stats:
+        lc = stat['label'].lower()
+        placed = False
+        for title, icon, kws, *_ in STAT_CATEGORIES:
+            if any(kw in lc for kw in kws):
+                buckets[title].append(stat); placed = True; break
+        if not placed: unclaimed.append(stat)
+    result = []
+    for title, icon, _, stage_key, subject in STAT_CATEGORIES:
+        items = buckets[title]
+        if not items: continue
+        summary = _stat_summary(title, stage_key, subject, stage_scores, items)
+        result.append((title, icon, summary, items))
+    if unclaimed: result.append(("Other", "\u25CB", None, unclaimed))
+    return result
+
+def _stat_summary(title, stage_key, subject, stage_scores, items):
+    if title == "File Information":
+        return "Technical file details — included for reference, not a forensic signal."
+    if title == "Face Analysis":
+        if any("no human face" in str(s.get('value','')).lower() for s in items):
+            return "No human face was detected in this image, so face-swap checks were not applicable."
+    score = stage_scores.get(stage_key) if stage_key else None
+    if score is None: return None
+    try: score = float(score)
+    except (TypeError, ValueError): return None
+    if score < 40:  return f"Low evidence of {subject} ({score:.0f}%)."
+    if score < 65:  return f"Some evidence of {subject} ({score:.0f}%) — worth a closer look."
+    return             f"Strong evidence of {subject} ({score:.0f}%)."
+
+
 # -- AnalysisResult  -  preserves original API exactly ---------------------------
 class AnalysisResult:
     """
@@ -263,14 +325,96 @@ class AnalysisResult:
             })
         return path
 
+    def _draw_detailed_metrics(self, c, categorized, page_num, total_pages, filename):
+        """Render the grouped Detailed Metrics section as one or more pages."""
+        C_CAT_BG    = HexColor('#0f2035')
+        C_ROW_ALT   = HexColor('#0a1628')
+        C_SUMM      = HexColor('#7ecfcf')
+        C_LABEL     = HexColor('#8b949e')
+        C_VALUE     = HexColor('#e6edf3')
+        ROW_H       = 6.5 * mm
+        COL_LABEL   = MARGIN_L
+        COL_VALUE   = MARGIN_L + 95 * mm
+        PAGE_H      = A4[1]
+        USABLE_TOP  = PAGE_H - 38 * mm
+        USABLE_BOT  = 22 * mm
+
+        def new_page():
+            nonlocal page_num
+            _draw_watermark(c)
+            _draw_header(c, self.job_id, page_num, total_pages)
+            _draw_footer(c, filename, self._generated_at)
+            c.setFillColor(HexColor('#00d4d4'))
+            c.setFont(FONT_B, 10)
+            c.drawString(MARGIN_L, PAGE_H - 30 * mm, 'DETAILED METRICS')
+            c.setStrokeColor(HexColor('#00d4d4'))
+            c.setLineWidth(0.5)
+            c.line(MARGIN_L, PAGE_H - 31.5 * mm, A4[0] - MARGIN_R, PAGE_H - 31.5 * mm)
+            page_num += 1
+            return USABLE_TOP
+
+        y = new_page()
+
+        for title, icon, summary, items in categorized:
+            need_h = 9*mm + (5*mm if summary else 0) + len(items)*ROW_H + 4*mm
+            if y - need_h < USABLE_BOT:
+                c.showPage()
+                y = new_page()
+
+            c.setFillColor(C_CAT_BG)
+            c.rect(MARGIN_L, y - 8*mm, A4[0]-MARGIN_L-MARGIN_R, 8*mm, fill=1, stroke=0)
+            c.setFillColor(HexColor('#00d4d4'))
+            c.setFont(FONT_B, 8)
+            c.drawString(MARGIN_L + 3*mm, y - 5.5*mm, f'{icon}  {title.upper()}')
+            y -= 9*mm
+
+            if summary:
+                c.setFont(FONT_R, 7.5)
+                c.setFillColor(C_SUMM)
+                words = summary.split()
+                line = ''
+                for word in words:
+                    if len(line) + len(word) + 1 > 90:
+                        c.drawString(MARGIN_L + 2*mm, y, line.strip())
+                        y -= 4.5*mm
+                        line = word + ' '
+                    else:
+                        line += word + ' '
+                if line.strip():
+                    c.drawString(MARGIN_L + 2*mm, y, line.strip())
+                    y -= 5.5*mm
+
+            for i, stat in enumerate(items):
+                if y - ROW_H < USABLE_BOT:
+                    c.showPage()
+                    y = new_page()
+                if i % 2 == 0:
+                    c.setFillColor(C_ROW_ALT)
+                    c.rect(MARGIN_L, y - ROW_H + 1.5*mm,
+                           A4[0]-MARGIN_L-MARGIN_R, ROW_H, fill=1, stroke=0)
+                c.setFont(FONT_R, 7)
+                c.setFillColor(C_LABEL)
+                c.drawString(COL_LABEL + 2*mm, y - 3.5*mm, stat['label'])
+                c.setFillColor(C_VALUE)
+                c.drawRightString(COL_VALUE + 55*mm, y - 3.5*mm, str(stat['value']))
+                y -= ROW_H
+
+            y -= 4*mm
+
+        c.showPage()
+        return page_num
+
     def build_pdf(self):
         """Build the professional PDF and write it to self.report_path."""
         filename    = self.payload.get("filename", "unknown")
         file_type   = self.payload.get("file_type", "")
-        score       = float(self.payload.get("final_score", 0))
-        threat      = self.payload.get("threat_level", "UNKNOWN")
-        verdict     = self.payload.get("verdict", "")
-        stage_scores = self.payload.get("stage_scores", {})
+        score          = float(self.payload.get("final_score", 0))
+        threat         = self.payload.get("threat_level", "UNKNOWN")
+        verdict        = self.payload.get("verdict", "")
+        stage_scores   = self.payload.get("stage_scores", {})
+        classification = self.payload.get("classification", "UNKNOWN")
+        real_score     = float(self.payload.get("real_score", 0))
+        stats          = self.payload.get("stats", [])
 
         total_pages = self._estimate_pages()
         buf = io.BytesIO()
@@ -284,7 +428,7 @@ class AnalysisResult:
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
-        self._draw_cover(c, score, threat, verdict, stage_scores, file_type, filename)
+        self._draw_cover(c, score, threat, verdict, stage_scores, file_type, filename, classification, real_score)
         c.showPage()
         page_num += 1
 
@@ -293,11 +437,19 @@ class AnalysisResult:
         for stage_label, items in groups.items():
             page_num = self._draw_graph_section(c, stage_label, items, page_num, total_pages)
 
+        # -- Detailed Metrics section (grouped stats, plain-language summaries) --
+        if stats:
+            categorized = _categorize_stats(stats, stage_scores)
+            if categorized:
+                page_num = self._draw_detailed_metrics(
+                    c, categorized, page_num, total_pages, filename
+                )
+
         # -- Final Verdict page ------------------------------------------------
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
-        self._draw_verdict_page(c, score, threat, stage_scores, verdict)
+        self._draw_verdict_page(c, score, threat, stage_scores, verdict, classification)
         c.showPage()
 
         c.save()
@@ -307,7 +459,7 @@ class AnalysisResult:
 
     # -- Internal PDF builders -------------------------------------------------
 
-    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename):
+    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', real_score=0.0):
         v_col = _verdict_color(threat)
         content_top = PAGE_H - MARGIN_T - HEADER_H - 6 * mm
 
@@ -351,7 +503,16 @@ class AnalysisResult:
 
         c.setFont(FONT_R, 7)
         c.setFillColor(C_TEXT_LIGHT)
-        c.drawString(MARGIN_L + 8 * mm, y - card_h + 5 * mm, "MANIPULATION PROBABILITY")
+        prob_label = "AUTHENTICITY SCORE" if classification == "REAL" else "MANIPULATION PROBABILITY"
+        c.drawString(MARGIN_L + 8 * mm, y - card_h + 5 * mm, prob_label)
+        # For REAL results, add a one-line note explaining both numbers so
+        # readers don't mistake the synthetic signal strength (shown here)
+        # for the authenticity confidence shown on the frontend.
+        if classification == "REAL" and real_score > 0:
+            c.setFont(FONT_R, 6)
+            c.setFillColor(C_TEXT_LIGHT)
+            note = f"Authenticity confidence: {real_score:.1f}% — score above reflects synthetic signal strength only"
+            c.drawString(MARGIN_L + 8 * mm, y - card_h - 2 * mm, note)
 
         div_x = MARGIN_L + 52 * mm
         c.setStrokeColor(HexColor("#1e2a3a"))
@@ -496,7 +657,7 @@ class AnalysisResult:
 
         return page_num
 
-    def _draw_verdict_page(self, c, score, threat, stage_scores, verdict):
+    def _draw_verdict_page(self, c, score, threat, stage_scores, verdict, classification='UNKNOWN'):
         v_col = _verdict_color(threat)
         content_top = PAGE_H - MARGIN_T - HEADER_H - 10 * mm
 
@@ -519,7 +680,8 @@ class AnalysisResult:
         c.drawCentredString(cx, cy - 5, f"{score:.1f}%")
         c.setFont(FONT_R, 6)
         c.setFillColor(C_TEXT_MID)
-        c.drawCentredString(cx, cy - 16, "MANIPULATION PROBABILITY")
+        prob_label = "AUTHENTICITY SCORE" if classification == "REAL" else "MANIPULATION PROBABILITY"
+        c.drawCentredString(cx, cy - 16, prob_label)
 
         y_after = cy - 28 * mm - 8 * mm
         c.setFont(FONT_B, 26)
