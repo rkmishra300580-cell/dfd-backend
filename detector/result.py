@@ -160,6 +160,45 @@ def _place_graph(c, img_path, x, y, w, h, caption=""):
     return bottom - 2 * mm
 
 
+# -- Stage breakdown whitelist ---------------------------------------------
+# Mirrors frontend STAGE_DISPLAY exactly (page.js) so the PDF's "Stage Score
+# Breakdown" (cover page) and "Analysis Stage Score" (verdict page) tables
+# never show a different set of fields than the on-screen stage tiles.
+# Previously both tables did `for k, v in stage_scores.items()` with no
+# filter at all, which pulled in fields that were never meant to be
+# displayed as a 0-100% score:
+#   - exif_ai_corroborated is a bool (True/False), not a score -> rendered
+#     as "1.0%" when True.
+#   - noise_residual_std is a raw pixel-value std-dev (e.g. 2.87), not a
+#     0-100 scale -> rendered as "2.9%" which looks like a score but isn't.
+# Restricting to this whitelist, in this order, fixes both without needing
+# any special-casing of individual keys.
+STAGE_ORDER = [
+    'exif_edit_score', 'frequency', 'face_forensics', 'manipulation',
+    'vehicle_damage', 'deep_learning', 'dl_ai_generated',
+]
+STAGE_LABELS = {
+    'exif_edit_score':  'EXIF Edit Signal',
+    'frequency':        'Frequency Analysis',
+    'face_forensics':   'Face Forensics',
+    'manipulation':     'Manipulation',
+    'vehicle_damage':   'Vehicle Damage',
+    'deep_learning':    'DL Deepfake',
+    'dl_ai_generated':  'DL AI-Generated',
+}
+
+def _stage_pairs(stage_scores):
+    """Whitelisted, ordered (label, value) pairs for stage-score tables."""
+    if not stage_scores:
+        return []
+    pairs = []
+    for key in STAGE_ORDER:
+        v = stage_scores.get(key)
+        if v is not None:
+            pairs.append((STAGE_LABELS[key], v))
+    return pairs
+
+
 def _score_bar(c, label, value, x, y, bar_w):
     try:
         value = float(value)
@@ -326,18 +365,28 @@ class AnalysisResult:
         return path
 
     def _draw_detailed_metrics(self, c, categorized, page_num, total_pages, filename):
-        """Render the grouped Detailed Metrics section as one or more pages."""
+        """
+        Render the grouped Detailed Metrics section as a tile grid, matching
+        the on-screen stat card layout (label on top, bold value below)
+        instead of a flat single-column label/value list. The previous flat
+        rows read as an undifferentiated wall of text; this mirrors what the
+        frontend already renders as individual stat cards.
+        """
+        C_TILE_BG   = HexColor('#0f2035')
+        C_TILE_BRD  = HexColor('#234268')
         C_CAT_BG    = HexColor('#0f2035')
-        C_ROW_ALT   = HexColor('#0a1628')
         C_SUMM      = HexColor('#7ecfcf')
-        C_LABEL     = HexColor('#8b949e')
+        C_LABEL     = HexColor('#8da3c2')
         C_VALUE     = HexColor('#e6edf3')
-        ROW_H       = 6.5 * mm
-        COL_LABEL   = MARGIN_L
-        COL_VALUE   = MARGIN_L + 95 * mm
         PAGE_H      = A4[1]
         USABLE_TOP  = PAGE_H - 38 * mm
         USABLE_BOT  = 22 * mm
+
+        COLS      = 3
+        GRID_W    = A4[0] - MARGIN_L - MARGIN_R
+        GAP       = 3 * mm
+        TILE_W    = (GRID_W - (COLS - 1) * GAP) / COLS
+        TILE_H    = 15 * mm
 
         def new_page():
             nonlocal page_num
@@ -353,16 +402,47 @@ class AnalysisResult:
             page_num += 1
             return USABLE_TOP
 
+        def draw_tile(x, y_top, stat):
+            """Single stat card: small muted label, bold value below."""
+            c.setFillColor(C_TILE_BG)
+            c.setStrokeColor(C_TILE_BRD)
+            c.setLineWidth(0.5)
+            c.roundRect(x, y_top - TILE_H, TILE_W, TILE_H, 2, fill=1, stroke=1)
+
+            c.setFont(FONT_R, 6.5)
+            c.setFillColor(C_LABEL)
+            label = stat['label']
+            max_label_w = TILE_W - 4 * mm
+            if c.stringWidth(label, FONT_R, 6.5) > max_label_w:
+                while label and c.stringWidth(label + '…', FONT_R, 6.5) > max_label_w:
+                    label = label[:-1]
+                if label != stat['label']:
+                    label += '…'
+            c.drawString(x + 2.5 * mm, y_top - 5.5 * mm, label)
+
+            c.setFont(FONT_B, 10)
+            c.setFillColor(C_VALUE)
+            value = str(stat['value'])
+            max_val_w = TILE_W - 4 * mm
+            if c.stringWidth(value, FONT_B, 10) > max_val_w:
+                while value and c.stringWidth(value + '…', FONT_B, 10) > max_val_w:
+                    value = value[:-1]
+                if value != str(stat['value']):
+                    value += '…'
+            c.drawString(x + 2.5 * mm, y_top - 11.5 * mm, value)
+
         y = new_page()
 
         for title, icon, summary, items in categorized:
-            need_h = 9*mm + (5*mm if summary else 0) + len(items)*ROW_H + 4*mm
+            rows_needed = math.ceil(len(items) / COLS)
+            grid_h = rows_needed * (TILE_H + GAP)
+            need_h = 9*mm + (5*mm if summary else 0) + grid_h + 4*mm
             if y - need_h < USABLE_BOT:
                 c.showPage()
                 y = new_page()
 
             c.setFillColor(C_CAT_BG)
-            c.rect(MARGIN_L, y - 8*mm, A4[0]-MARGIN_L-MARGIN_R, 8*mm, fill=1, stroke=0)
+            c.rect(MARGIN_L, y - 8*mm, GRID_W, 8*mm, fill=1, stroke=0)
             c.setFillColor(HexColor('#00d4d4'))
             c.setFont(FONT_B, 8)
             c.drawString(MARGIN_L + 3*mm, y - 5.5*mm, f'{icon}  {title.upper()}')
@@ -385,19 +465,14 @@ class AnalysisResult:
                     y -= 5.5*mm
 
             for i, stat in enumerate(items):
-                if y - ROW_H < USABLE_BOT:
+                col = i % COLS
+                if col == 0 and y - TILE_H < USABLE_BOT:
                     c.showPage()
                     y = new_page()
-                if i % 2 == 0:
-                    c.setFillColor(C_ROW_ALT)
-                    c.rect(MARGIN_L, y - ROW_H + 1.5*mm,
-                           A4[0]-MARGIN_L-MARGIN_R, ROW_H, fill=1, stroke=0)
-                c.setFont(FONT_R, 7)
-                c.setFillColor(C_LABEL)
-                c.drawString(COL_LABEL + 2*mm, y - 3.5*mm, stat['label'])
-                c.setFillColor(C_VALUE)
-                c.drawRightString(COL_VALUE + 55*mm, y - 3.5*mm, str(stat['value']))
-                y -= ROW_H
+                tx = MARGIN_L + col * (TILE_W + GAP)
+                draw_tile(tx, y, stat)
+                if col == COLS - 1 or i == len(items) - 1:
+                    y -= TILE_H + GAP
 
             y -= 4*mm
 
@@ -542,11 +617,7 @@ class AnalysisResult:
         c.line(MARGIN_L, y - 3, MARGIN_L + CONTENT_W, y - 3)
         y -= 12
 
-        pairs = []
-        if stage_scores:
-            for k, v in stage_scores.items():
-                if v is not None:
-                    pairs.append((k.replace("_", " ").title(), v))
+        pairs = _stage_pairs(stage_scores)
         if not pairs:
             pairs = [("Final Score", score)]
 
@@ -705,11 +776,7 @@ class AnalysisResult:
         c.drawRightString(table_x + table_w - 3, y - 5.5, "Score")
         y -= 8
 
-        rows = []
-        if stage_scores:
-            for k, v in stage_scores.items():
-                if v is not None:
-                    rows.append((k.replace("_", " ").title(), v))
+        rows = _stage_pairs(stage_scores)
         rows.append(("Final Score", score))
 
         for k, (label, val) in enumerate(rows):
