@@ -76,6 +76,7 @@ def run_pipeline(filepath: str, job_id: str) -> dict:
             R.payload.get('indicators', []),
             clf['classification'],
             has_human_face=R.payload.get('has_human_face', True),
+            manipulation_type=clf.get('manipulation_type'),
         )
 
         # Merge classification fields into payload
