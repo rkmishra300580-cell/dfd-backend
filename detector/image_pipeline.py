@@ -1097,6 +1097,19 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
         dl_ai_score     = float(statistics.mean(_ai_scores))
         dl_ai_available = True
         R.add_stat('DL AI-Gen Ensemble Scores', ' / '.join(f'{s:.1f}' for s in _ai_scores))
+        # Also expose the raw max alongside the mean. The mean is what feeds
+        # the weighted ai_gen_composite as before (unchanged) - averaging is
+        # still the right call for the *typical* case, since it protects
+        # against either model spuriously firing high on a real photo.
+        # But when one model is EXTREMELY confident (>=90) and the other
+        # isn't, averaging silently destroys a genuine true-positive - see
+        # the DL_AI_CONCLUSIVE_THRESHOLD ceiling in helpers.py, which reads
+        # this value to treat that single confident reading as near-
+        # conclusive rather than letting the mean dilute it away.
+        dl_ai_ensemble_max = float(max(_ai_scores))
+        R.payload['stage_scores']['dl_ai_ensemble_max'] = round(dl_ai_ensemble_max, 1)
+    else:
+        R.payload['stage_scores']['dl_ai_ensemble_max'] = None
 
     R.add_stat('DL Deepfake Score', f'{dl_deepfake_score:.1f}%')
     R.add_stat('DL Deepfake Label', matched_label)
@@ -1197,7 +1210,16 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
     R.add_stat('Vehicle Score',      f'{vehicle_score:.1f}%')
     R.add_stat('DL Score',           f'{fake_score:.1f}%')
     R.add_stat('Fusion Mode',        'Face image' if has_human_face else 'Vehicle/object image')
-    R.add_stat('Final Fusion Score', f'{final:.1f}%')
+    # NOTE: this value is NOT the report's actual final score. pipeline.py
+    # always calls classify_dominant() after analyze_image() returns, which
+    # independently computes and overwrites payload['final_score'] via its
+    # own per-model-floor composite logic (helpers.py). This fusion formula
+    # predates that logic and is no longer used for classification - it was
+    # still labelled "Final Fusion Score" in the report, which meant two
+    # different numbers both looked like "the final score" and disagreed
+    # by 20-60 points in real cases (e.g. 30.0% here vs 96.0% actual).
+    # Kept only as a legacy diagnostic value, clearly labelled as such.
+    R.add_stat('Legacy Pre-Fusion Score (diagnostic only, not the report score)', f'{final:.1f}%')
 
     return final
 
@@ -1272,8 +1294,8 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
             result['conclusive_findings'].append(f'[EXIF] {finding}')
             R.add_indicator(f'[EXIF] {finding}')
 
-        # Zero EXIF on a JPEG — JPEGs from real cameras always have EXIF,
-        # BUT this is genuinely ambiguous on its own: messaging apps
+        # Zero EXIF on a JPEG or PNG — JPEGs from real cameras always have
+        # EXIF, BUT this is genuinely ambiguous on its own: messaging apps
         # (WhatsApp, Telegram, Signal) strip ALL EXIF on send by default,
         # as do many phone camera apps for privacy, and so do simple re-saves.
         # A photo transmitted via WhatsApp (filenames like
@@ -1285,22 +1307,40 @@ def exif_analysis(filepath, pil_raw, R: AnalysisResult) -> dict:
         # single unconditional +70.
         #
         # Fix: this signal alone now only contributes a reduced base score.
-        # PNG/WebP from the web legitimately have no EXIF, so only flag JPEG.
         # The score is boosted back up later, in analyze_image(), but ONLY
         # if corroborated by another independent signal (elevated dl_ai_
         # generated, or frequency/noise signals also flagging) — see the
         # "no-EXIF corroboration" block after frequency analysis runs.
         # 'exif_no_metadata_flagged' lets that later block find this finding.
+        #
+        # PNG added 2026-07-12: previously JPEG-only, on the reasoning that
+        # "PNG/WebP from the web legitimately have no EXIF, so only flag
+        # JPEG." That's true, but it meant a PNG with zero EXIF got NO
+        # contribution from this entire channel — including the
+        # corroboration path, which would otherwise have caught it (a real
+        # ChatGPT-generated PNG surfaced this: dl_ai_generated was already
+        # 66.5, well above the 40-point corroboration threshold, but
+        # exif_ai_score stayed at 0 because the format check excluded PNG
+        # entirely, rather than applying the same reduced-base+corroboration
+        # treatment already proven safe for JPEG). PNG is now a common
+        # export format for AI image generators, and it carries the exact
+        # same ambiguity as JPEG (legitimate web/screenshot PNGs also lack
+        # EXIF) — the existing corroboration requirement already protects
+        # against penalizing innocently-EXIF-less PNGs, so extending the
+        # same JPEG treatment to PNG doesn't remove that protection, it just
+        # stops silently skipping the check for one common format.
+        # WebP intentionally left out — no evidence yet motivating it.
         img_format = str(getattr(pil_raw, 'format', '') or '').upper()
-        if len(exif_dict) == 0 and img_format == 'JPEG':
+        NO_EXIF_ELIGIBLE_FORMATS = ('JPEG', 'PNG')
+        if len(exif_dict) == 0 and img_format in NO_EXIF_ELIGIBLE_FORMATS:
             ai_score += 25  # reduced base score — was an unconditional 70
-            finding = 'No metadata present in this JPEG — ambiguous on its own (common with messaging-app transmission); see corroboration check'
+            finding = f'No metadata present in this {img_format} — ambiguous on its own (common with messaging-app transmission or web-sourced images); see corroboration check'
             result['conclusive_findings'].append(f'[EXIF] {finding}')
             R.add_indicator(f'[EXIF] {finding}')
             result['exif_no_metadata_flagged'] = True
-        elif len(exif_dict) < 3 and img_format == 'JPEG' and not matched_ai_tool:
+        elif len(exif_dict) < 3 and img_format in NO_EXIF_ELIGIBLE_FORMATS and not matched_ai_tool:
             ai_score += 15  # reduced base score — was an unconditional 35, same rationale
-            finding = f'Minimal metadata ({len(exif_dict)} fields) in JPEG — metadata may have been stripped (ambiguous alone)'
+            finding = f'Minimal metadata ({len(exif_dict)} fields) in {img_format} — metadata may have been stripped (ambiguous alone)'
             result['conclusive_findings'].append(f'[EXIF] {finding}')
             R.add_indicator(f'[EXIF] {finding}')
             result['exif_no_metadata_flagged'] = True
