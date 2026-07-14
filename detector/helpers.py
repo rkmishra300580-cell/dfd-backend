@@ -26,11 +26,15 @@ import matplotlib.pyplot as plt
 # 45.0 (raised from 35.0): prevents borderline sdxl-detector false positives
 # on real photographs from triggering AI_GENERATED classification.
 SYNTHETIC_THRESHOLD  = 45.0
-# Editing detected: when exif_edit_composite >= this AND classification resolves
-# to REAL, the label becomes 'REAL (Edited)'. Sub-class of REAL — not synthetic.
+# Editing detected: when edit_composite >= this AND neither the deepfake
+# nor AI-generation track already crossed effective_threshold, the image
+# classifies as DEEPFAKE (manipulation_type='EDITED') rather than REAL.
+# Per product decision: any detected manipulation - AI-driven or manual/
+# Photoshop - is DEEPFAKE, not a REAL variant. (Previously this produced a
+# 'REAL (Edited)' sub-label; see classify_dominant() for the full change.)
 # exif_edit=45 (Photoshop tag) alone → 45*0.70=31.5 → stays REAL (correct)
-# exif_edit=45 + manip=30 → 31.5+9=40.5 → REAL (Edited)
-# exif_edit=70 (stripped+ICC) alone → 49 → REAL (Edited)
+# exif_edit=45 + manip=30 → 31.5+9=40.5 → DEEPFAKE (Edited)
+# exif_edit=70 (stripped+ICC) alone → 49 → DEEPFAKE (Edited)
 EDITED_THRESHOLD     = 40.0
 # When synthetic: deepfake wins if deepfake_composite >= this
 DEEPFAKE_THRESHOLD   = 50.0
@@ -55,6 +59,12 @@ AI_GEN_THRESHOLD     = 45.0
 # instead of the real 45-point AI_GEN_THRESHOLD wrongly suggested 0.70.
 DL_DEEPFAKE_FLOOR = 0.80   # prithivMLmods — validated, face-specific, high trust
 DL_AI_FLOOR       = 0.60   # sdxl-detector ensemble — unvalidated, lower trust
+# When EITHER ensemble member alone reports confidence at/above this, treat
+# it as near-conclusive (see the ceiling applied in _compute_image_composites
+# below) rather than letting the ensemble MEAN dilute it. Only fires on the
+# raw max score, not the averaged dl_ai used everywhere else - see that
+# ceiling's comment for the real case and the known trade-off.
+DL_AI_CONCLUSIVE_THRESHOLD = 90.0
 
 
 # ── Per-modality composite score functions ────────────────────────────────────
@@ -77,6 +87,10 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
     """
     dl_deepfake  = float(stage.get('deep_learning',   0) or 0)
     dl_ai        = float(stage.get('dl_ai_generated', 0) or 0)
+    # Raw max of the two AI-gen ensemble members (not the averaged dl_ai
+    # above). Falls back to dl_ai itself if a payload predates this field.
+    dl_ai_ensemble_max = stage.get('dl_ai_ensemble_max')
+    dl_ai_ensemble_max = float(dl_ai_ensemble_max) if dl_ai_ensemble_max is not None else dl_ai
     freq         = float(stage.get('frequency',       0) or 0)
     manip        = float(stage.get('manipulation',    0) or 0)
     face         = stage.get('face_forensics')    # None when no face
@@ -123,44 +137,64 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
         ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
     ai_gen_composite = max(ai_gen_composite, dl_ai * DL_AI_FLOOR)
 
-    # EXIF conclusive-AI ceiling only applies when there is no human face,
-    # AND when exif_ai reflects intrinsic EXIF evidence (not corroboration-
-    # derived). Two reasons:
-    # 1. (existing) On face images the deepfake DL model is the primary
-    #    signal; allowing a 70% EXIF score to floor ai_gen_composite at 63
-    #    can flip DEEPFAKE->AI_GENERATED even when the face-specific model
-    #    scored 76.9% — wrong trade-off. EXIF can't distinguish face-swap
-    #    from AI-generated; the face pipeline can.
-    # 2. (new) When exif_ai reached 70 via the no-EXIF-corroboration block
-    #    (image_pipeline.py), it got there by borrowing strength from
-    #    dl_ai_generated or frequency — signals already counted directly in
-    #    the weighted ai_gen_composite average above, and already protected
-    #    by the per-model floor if they're dominant. Applying the EXIF
-    #    ceiling on top double-counts that same signal a second time via a
-    #    different path. Real case: dl_ai=84.4 corroborates exif_ai to 70;
-    #    weighted composite is already 62.4 (dl_ai counted once, correctly);
-    #    the ceiling then pushed it to 63.0 by re-counting dl_ai's influence
-    #    through the EXIF channel. Skipping the ceiling here doesn't lose
-    #    protection — DL_AI_FLOOR (0.60 x dl_ai)
-    #    already guarantees ai_gen_composite >= dl_ai*0.65 = 54.9 in this case.
-    if exif_ai >= EXIF_CONCLUSIVE_AI and not has_face and not exif_ai_corroborated:
+    # ── Conclusive-evidence boosts ──────────────────────────────────────────
+    # Three separate mechanisms below each say "if ONE signal is extremely
+    # confident, trust it — don't let a weighted blend with weaker co-signals
+    # dilute it away." They were added at different times for different real
+    # cases (ensemble dilution, EXIF-only evidence, clean-noise AI faces).
+    # Structural review found they'd been given INCONSISTENT protection
+    # against the same failure mode: a real photo that also happens to carry
+    # strong genuine-camera EXIF should never be pushed toward synthetic by
+    # any of these, but only the first one (added later, after a stress test
+    # caught it) actually checked for that. All three now share the exact
+    # same gate: `exif_real < EXIF_CONCLUSIVE_REAL`. This is deliberately a
+    # hard cutoff (skip the boost entirely), not a proportional dampening —
+    # the proportional suppression a few lines below is a separate, weaker
+    # safety net for cases that fall under this cutoff.
+
+    # 1. DL AI-Gen ensemble-max ceiling (see full rationale where this was
+    #    first introduced): either ensemble member alone reporting >=90%
+    #    confidence is treated as near-conclusive.
+    if dl_ai_ensemble_max >= DL_AI_CONCLUSIVE_THRESHOLD and exif_real < EXIF_CONCLUSIVE_REAL:
+        ai_gen_composite = max(ai_gen_composite, dl_ai_ensemble_max)
+
+    # 2. EXIF conclusive-AI ceiling. Restricted to non-face images (see
+    #    rationale below) and to intrinsic (non-corroborated) EXIF evidence,
+    #    to avoid double-counting dl_ai/frequency through the EXIF channel.
+    #    On face images the deepfake DL model is the primary signal; allowing
+    #    a 70% EXIF score to floor ai_gen_composite at 63 can flip
+    #    DEEPFAKE->AI_GENERATED even when the face model scored 76.9% higher
+    #    on the correct track. EXIF can't distinguish face-swap from
+    #    AI-generated; the face pipeline can.
+    if exif_ai >= EXIF_CONCLUSIVE_AI and not has_face and not exif_ai_corroborated \
+            and exif_real < EXIF_CONCLUSIVE_REAL:
         ai_gen_composite = max(ai_gen_composite, exif_ai * 0.90)
 
+    # 3. H6: standalone low-noise signal on face images. Real camera photos
+    #    with faces almost always show noise_residual_std > 3; AI-generated
+    #    faces are characteristically clean (std < 2). Fires independently
+    #    of EXIF state - catches cases where EXIF was stripped entirely.
+    #    Same gate as the two mechanisms above: a real photo taken in good
+    #    light can legitimately have low sensor noise too, so this must not
+    #    fire when strong real-camera EXIF already contradicts it - this was
+    #    the one of the three that structural review found WITHOUT this gate.
+    noise_std = float(stage.get('noise_residual_std', 999) or 999)
+    if has_face and noise_std < 3.0 and exif_real < EXIF_CONCLUSIVE_REAL:
+        noise_contribution = (3.0 - noise_std) / 3.0 * 20.0  # max 20pts at std=0
+        ai_gen_composite = min(100.0, ai_gen_composite + noise_contribution)
+
+    # ── Real-camera-evidence suppression (proportional, applies to everything
+    # above) ─────────────────────────────────────────────────────────────────
+    # Placed AFTER all three conclusive-evidence boosts so it can never be
+    # bypassed by a later additive adjustment - every boost above either gets
+    # gated out entirely (exif_real >= 65) or, if it fired (exif_real < 65),
+    # still passes through this proportional dampening below if exif_real
+    # is elevated but under the hard cutoff.
     if exif_real >= EXIF_CONCLUSIVE_REAL:
         suppression_factor = 1.0 - (exif_real - EXIF_CONCLUSIVE_REAL) / 100.0 * 0.6
         suppression_factor = max(suppression_factor, 0.35)
         deepfake_composite  *= suppression_factor
         ai_gen_composite    *= suppression_factor
-
-    # H6: standalone low-noise signal on face images.
-    # Real camera photos with faces almost always show noise_residual_std > 3.
-    # AI-generated faces are characteristically clean (std < 2). This fires
-    # independently of EXIF state — the existing cross-check only runs when
-    # exif_real_score >= 50, missing cases where EXIF was stripped entirely.
-    noise_std = float(stage.get('noise_residual_std', 999) or 999)
-    if has_face and noise_std < 3.0:
-        noise_contribution = (3.0 - noise_std) / 3.0 * 20.0  # max 20pts at std=0
-        ai_gen_composite = min(100.0, ai_gen_composite + noise_contribution)
 
     # edit_composite: editing software tag (0.70) + forensic manipulation (0.30).
     # A colour-grade alone won't fire ELA/PRNU, so exif_edit carries it solo.
@@ -265,39 +299,60 @@ def classify_dominant(payload: dict) -> dict:
     exif_real_for_threshold = float(stage.get('exif_real_score', 0) or 0)
     effective_threshold = SYNTHETIC_THRESHOLD + exif_real_for_threshold * 0.30
 
+    has_face = stage.get('face_forensics') is not None
+
     # ── Two-level decision ────────────────────────────────────────────────────
     if synthetic_score < effective_threshold:
-        classification   = 'REAL'
-        dominant_score   = real_score
-        # Sub-classification: was the image edited even if not synthetically generated?
-        # editing_detected is set here and carried in the return dict.
-        # The frontend uses it to display 'REAL (Edited)' instead of plain 'REAL'.
-        # Threshold is conservative: requires editing software tag + some forensic
-        # corroboration, so a bare Photoshop tag on an untouched export stays 'REAL'.
+        # Neither the deepfake nor AI-generation track crossed the bar - but
+        # editing evidence (Photoshop/Lightroom tag + forensic corroboration)
+        # is a SEPARATE, third signal checked here.
+        #
+        # TAXONOMY CHANGE: previously this sub-classified as 'REAL (Edited)' -
+        # a REAL variant, not a synthetic classification. Per explicit product
+        # decision, any detected manipulation - AI-driven or manual/Photoshop -
+        # is now classified as DEEPFAKE, not REAL. 'DEEPFAKE' here is being
+        # used in the broader sense of "this image was manipulated," not only
+        # "face identity was swapped." manipulation_type distinguishes the two
+        # for anyone reading the report who needs to know which (e.g. an
+        # insurance investigator cares whether a claim photo was Photoshopped
+        # vs. face-swapped, even though both now show the same top-level badge).
         editing_detected = (edit_composite >= EDITED_THRESHOLD)
-        dominant_label   = f'{dominant_score:.0f}% REAL (Edited)' if editing_detected else f'{dominant_score:.0f}% REAL'
+        if editing_detected:
+            classification    = 'DEEPFAKE'
+            dominant_score    = edit_composite
+            manipulation_type = 'EDITED'
+            dominant_label    = f'{dominant_score:.0f}% DEEPFAKE (Edited)'
+        else:
+            classification    = 'REAL'
+            dominant_score    = real_score
+            manipulation_type = None
+            dominant_label    = f'{dominant_score:.0f}% REAL'
 
     elif deepfake_composite >= DEEPFAKE_THRESHOLD and deepfake_composite >= ai_gen_composite:
-        classification   = 'DEEPFAKE'
-        dominant_score   = deepfake_composite
-        dominant_label   = f'{dominant_score:.0f}% DEEPFAKE'
-        editing_detected = False
+        classification    = 'DEEPFAKE'
+        dominant_score    = deepfake_composite
+        manipulation_type = 'FACE_SWAP' if has_face else 'MANIPULATION'
+        dominant_label    = f'{dominant_score:.0f}% DEEPFAKE'
+        editing_detected  = False
 
     elif ai_gen_composite >= AI_GEN_THRESHOLD:
-        classification   = 'AI_GENERATED'
-        dominant_score   = ai_gen_composite
-        dominant_label   = f'{dominant_score:.0f}% AI GENERATED'
-        editing_detected = False
+        classification    = 'AI_GENERATED'
+        dominant_score    = ai_gen_composite
+        manipulation_type = None
+        dominant_label    = f'{dominant_score:.0f}% AI GENERATED'
+        editing_detected  = False
 
     else:
         # Synthetic signal present but neither track is dominant enough
         # → lean toward whichever composite is higher, flag as low confidence
         if deepfake_composite >= ai_gen_composite:
-            classification = 'DEEPFAKE'
-            dominant_score = deepfake_composite
+            classification   = 'DEEPFAKE'
+            dominant_score   = deepfake_composite
+            manipulation_type = 'FACE_SWAP' if has_face else 'MANIPULATION'
         else:
-            classification = 'AI_GENERATED'
-            dominant_score = ai_gen_composite
+            classification   = 'AI_GENERATED'
+            dominant_score   = ai_gen_composite
+            manipulation_type = None
         dominant_label   = f'{dominant_score:.0f}% {classification.replace("_", " ")} (low confidence)'
         editing_detected = False
 
@@ -332,12 +387,13 @@ def classify_dominant(payload: dict) -> dict:
         # ── New fields (dominant classification) ──────────────────────────────
         'classification':      classification,
         'dominant_score':      round(dominant_score, 1),
-        'dominant_label':      dominant_label,      # e.g. "78% DEEPFAKE" or "92% REAL (Edited)"
+        'dominant_label':      dominant_label,      # e.g. "78% DEEPFAKE" or "64% DEEPFAKE (Edited)"
         'real_score':          round(real_score, 1),
         'ai_generated_score':  round(ai_gen_composite, 1),
         'deepfake_score':      round(deepfake_composite, 1),
-        'edited_score':        round(edit_composite, 1),   # NEW: editing signal strength
-        'editing_detected':    editing_detected,           # NEW: True → show 'REAL (Edited)'
+        'edited_score':        round(edit_composite, 1),   # editing signal strength
+        'editing_detected':    editing_detected,  # True → classification is DEEPFAKE via the editing track specifically
+        'manipulation_type':   manipulation_type, # 'FACE_SWAP' | 'MANIPULATION' | 'EDITED' | None (REAL/AI_GENERATED) - which evidence drove a DEEPFAKE classification, since 'DEEPFAKE' now covers both identity manipulation and manual/AI editing
         'risk_level':          risk_level,
         # ── Updated legacy fields ─────────────────────────────────────────────
         'final_score':         round(legacy_score, 1),
@@ -345,12 +401,14 @@ def classify_dominant(payload: dict) -> dict:
         'verdict':             verdict_text_v2(classification, dominant_score,
                                                deepfake_composite, ai_gen_composite,
                                                file_type=file_type,
-                                               editing_detected=editing_detected),
+                                               editing_detected=editing_detected,
+                                               manipulation_type=manipulation_type),
     }
 
 
 def filter_indicators(indicators: list, classification: str,
-                      has_human_face: bool = True) -> list:
+                      has_human_face: bool = True,
+                      manipulation_type: str = None) -> list:
     """
     Return only indicators that support the dominant classification
     AND are appropriate for the detected content type (face vs vehicle).
@@ -365,8 +423,20 @@ def filter_indicators(indicators: list, classification: str,
       Pass 2 — Classification gate
         REAL         → keep only indicators that support authenticity
                        (in practice almost none fire for REAL verdicts)
-        DEEPFAKE     → keep [Face], [Manipulation], [DL], [EXIF] manipulation
-                       signals. Drop pure AI-generation frequency signals.
+        DEEPFAKE     → manipulation_type distinguishes which evidence to keep:
+                       'FACE_SWAP'/'MANIPULATION' → [Face], [Manipulation],
+                       [DL] identity-manipulation signals (unchanged from
+                       before this classification also covered editing).
+                       'EDITED' → [EXIF] editing-software tag, [Manipulation]
+                       forensics (ELA/PRNU/copy-move) - the evidence that
+                       actually drove this classification. Was previously
+                       unreachable dead code: the REAL branch above caught
+                       and returned [] for every REAL case unconditionally,
+                       before a same-condition `elif classification == 'REAL'`
+                       further down could ever run - so "REAL (Edited)"
+                       reports always showed zero indicators regardless of
+                       what evidence was found. Now reachable, since editing
+                       evidence classifies as DEEPFAKE, not REAL.
         AI_GENERATED → keep [Frequency], [EXIF] AI-gen signals, [Vehicle]
                        (already gated out for face images in Pass 1).
                        Drop [Face] deepfake signals.
@@ -440,12 +510,22 @@ def filter_indicators(indicators: list, classification: str,
         return []
 
     elif classification == 'DEEPFAKE':
+        EDITED_TAGS = ['[EXIF]', '[Manipulation]', 'editing software',
+                       'ELA', 'PRNU', 'copy-move', 'patch', 'metadata']
         result = []
         for i in indicators:
             mod = _modality(i)
-            if   mod == 'VIDEO'                 : keep = _matches(i, VIDEO_DEEPFAKE_TAGS)
-            elif mod in ('AUDIO', 'DOCUMENT')    : keep = False  # no deepfake-track indicators exist for these
-            else                                  : keep = _matches(i, DEEPFAKE_TAGS)
+            if manipulation_type == 'EDITED':
+                # Editing-track DEEPFAKE: keep the evidence that actually
+                # drove this (EXIF editing tag + manipulation forensics),
+                # not face/identity-manipulation signals.
+                keep = _matches(i, EDITED_TAGS)
+            elif mod == 'VIDEO':
+                keep = _matches(i, VIDEO_DEEPFAKE_TAGS)
+            elif mod in ('AUDIO', 'DOCUMENT'):
+                keep = False  # no deepfake-track indicators exist for these
+            else:
+                keep = _matches(i, DEEPFAKE_TAGS)
             if keep: result.append(i)
         return result
 
@@ -464,18 +544,6 @@ def filter_indicators(indicators: list, classification: str,
             if keep: result.append(i)
         return result
 
-    elif classification == 'REAL':
-        # When editing_detected=True the classification is still 'REAL' — keep
-        # EXIF editing indicators and manipulation forensics. Drop AI-gen and
-        # deepfake-specific signals so they don't confuse the user.
-        EDITED_TAGS = ['[EXIF]', '[Manipulation]', 'editing software',
-                       'ELA', 'PRNU', 'copy-move', 'patch', 'metadata']
-        # If no editing indicators exist (plain REAL), this returns [] per
-        # the existing REAL branch above — this branch is only reached for
-        # REAL (Edited) where indicators survived Pass 1.
-        result = [i for i in indicators if _matches(i, EDITED_TAGS)]
-        return result
-
     # Unknown / fallback — return what survived Pass 1
     return indicators
 
@@ -483,13 +551,17 @@ def filter_indicators(indicators: list, classification: str,
 def verdict_text_v2(classification: str, dominant_score: float,
                     deepfake_score: float, ai_gen_score: float,
                     file_type: str = 'IMAGE',
-                    editing_detected: bool = False) -> str:
+                    editing_detected: bool = False,
+                    manipulation_type: str = None) -> str:
     """
     Legally safe verdict language tied to dominant classification.
     Avoids definitive statements. Phrasing is modality-aware - "captured by
     a real camera" doesn't make sense for a document, and image-style
     "face-swapping" language doesn't fit a cloned voice.
-    editing_detected=True produces 'REAL (Edited)' language when classification=REAL.
+    manipulation_type=='EDITED' produces distinct 'this was edited, not
+    face-swapped/AI-generated' language within the DEEPFAKE branch - the
+    top-level classification is the same (DEEPFAKE), but a reader still
+    needs to know which kind of manipulation was actually found.
     """
     score_str = f'{dominant_score:.0f}/100'
 
@@ -507,21 +579,26 @@ def verdict_text_v2(classification: str, dominant_score: float,
     }
 
     if classification == 'REAL':
-        if editing_detected:
-            return (
-                'Content appears to originate from a genuine source, but forensic '
-                'analysis detected evidence of professional editing or post-processing. '
-                'The underlying image is not assessed as AI-generated or deepfake. '
-                'Edits may include colour grading, retouching, cropping, or other '
-                'common photo-editing workflows. This does not indicate fabrication '
-                'or synthetic generation.'
-            )
+        # editing_detected can never be True here — editing evidence now
+        # classifies as DEEPFAKE (see manipulation_type=='EDITED' below),
+        # not as a REAL sub-variant.
         return (
             'No significant indicators of synthetic manipulation were detected. '
             'Content appears consistent with authentic, unedited media under '
             'current forensic analysis.'
         )
     elif classification == 'DEEPFAKE':
+        if manipulation_type == 'EDITED':
+            return (
+                f'Forensic analysis detected evidence of editing or post-processing '
+                f'(score {score_str}) - for example colour grading, retouching, cloning, '
+                f'or other manipulation-software traces. This differs from face-swapping '
+                f'or AI-generated content: the underlying media appears to originate from '
+                f'a real source that was subsequently altered, rather than being '
+                f'synthetically generated or having an identity substituted. This '
+                f'assessment is based on automated forensic analysis and should be '
+                f'verified by a qualified analyst before being used as evidence.'
+            )
         phrase = DEEPFAKE_PHRASING.get(file_type, DEEPFAKE_PHRASING['IMAGE'])
         return (
             f'Multiple indicators associated with deepfake manipulation were detected '
