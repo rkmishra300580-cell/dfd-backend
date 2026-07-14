@@ -491,6 +491,20 @@ class AnalysisResult:
         real_score     = float(self.payload.get("real_score", 0))
         stats          = self.payload.get("stats", [])
 
+        # display_score is what actually gets headlined as the big number.
+        # Previously the cover/verdict pages always headlined `score`
+        # (= final_score, the synthetic-signal strength) even when the
+        # label above it said "AUTHENTICITY SCORE" for REAL results - e.g.
+        # a REAL result showing "39.9% / AUTHENTICITY SCORE" with a small
+        # footnote clarifying the real authenticity number was actually
+        # 60.1%. The footnote was a patch over a label that didn't match
+        # the number. Now the headline and label always agree; `score`
+        # (raw synthetic strength) is kept as a secondary line for REAL
+        # results, since it's still useful context (matches Stage Score
+        # Breakdown / Final Score row), just no longer the misleading
+        # headline.
+        display_score = real_score if classification == "REAL" else score
+
         total_pages = self._estimate_pages()
         buf = io.BytesIO()
         c = canvas.Canvas(buf, pagesize=A4)
@@ -503,7 +517,7 @@ class AnalysisResult:
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
-        self._draw_cover(c, score, threat, verdict, stage_scores, file_type, filename, classification, real_score)
+        self._draw_cover(c, display_score, threat, verdict, stage_scores, file_type, filename, classification, score)
         c.showPage()
         page_num += 1
 
@@ -524,7 +538,7 @@ class AnalysisResult:
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
-        self._draw_verdict_page(c, score, threat, stage_scores, verdict, classification)
+        self._draw_verdict_page(c, display_score, threat, stage_scores, verdict, classification, score)
         c.showPage()
 
         c.save()
@@ -534,7 +548,7 @@ class AnalysisResult:
 
     # -- Internal PDF builders -------------------------------------------------
 
-    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', real_score=0.0):
+    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', raw_score=0.0):
         v_col = _verdict_color(threat)
         content_top = PAGE_H - MARGIN_T - HEADER_H - 6 * mm
 
@@ -580,13 +594,14 @@ class AnalysisResult:
         c.setFillColor(C_TEXT_LIGHT)
         prob_label = "AUTHENTICITY SCORE" if classification == "REAL" else "MANIPULATION PROBABILITY"
         c.drawString(MARGIN_L + 8 * mm, y - card_h + 5 * mm, prob_label)
-        # For REAL results, add a one-line note explaining both numbers so
-        # readers don't mistake the synthetic signal strength (shown here)
-        # for the authenticity confidence shown on the frontend.
-        if classification == "REAL" and real_score > 0:
+        # For REAL results, add a one-line secondary note giving the raw
+        # synthetic-signal strength too (matches the Stage Score Breakdown /
+        # Final Score row below) - context, not correction: the headline
+        # above is now already the authenticity number the label promises.
+        if classification == "REAL":
             c.setFont(FONT_R, 6)
             c.setFillColor(C_TEXT_LIGHT)
-            note = f"Authenticity confidence: {real_score:.1f}% — score above reflects synthetic signal strength only"
+            note = f"Synthetic signal strength: {raw_score:.1f}% — see Stage Score Breakdown below"
             c.drawString(MARGIN_L + 8 * mm, y - card_h - 2 * mm, note)
 
         div_x = MARGIN_L + 52 * mm
@@ -619,7 +634,7 @@ class AnalysisResult:
 
         pairs = _stage_pairs(stage_scores)
         if not pairs:
-            pairs = [("Final Score", score)]
+            pairs = [("Final Score", raw_score)]
 
         bw = CONTENT_W - 4 * mm
         for label, val in pairs:
@@ -728,7 +743,7 @@ class AnalysisResult:
 
         return page_num
 
-    def _draw_verdict_page(self, c, score, threat, stage_scores, verdict, classification='UNKNOWN'):
+    def _draw_verdict_page(self, c, score, threat, stage_scores, verdict, classification='UNKNOWN', raw_score=None):
         v_col = _verdict_color(threat)
         content_top = PAGE_H - MARGIN_T - HEADER_H - 10 * mm
 
@@ -753,6 +768,14 @@ class AnalysisResult:
         c.setFillColor(C_TEXT_MID)
         prob_label = "AUTHENTICITY SCORE" if classification == "REAL" else "MANIPULATION PROBABILITY"
         c.drawCentredString(cx, cy - 16, prob_label)
+        # Secondary line for REAL results: the headline above is now the
+        # authenticity number the label promises; this keeps the raw
+        # synthetic-strength number visible too (matches cover page + the
+        # "Final Score" row in the table below), just not as the headline.
+        if classification == "REAL" and raw_score is not None:
+            c.setFont(FONT_R, 5)
+            c.setFillColor(C_TEXT_LIGHT)
+            c.drawCentredString(cx, cy - 22, f"(synthetic signal strength: {raw_score:.1f}%)")
 
         y_after = cy - 28 * mm - 8 * mm
         c.setFont(FONT_B, 26)
@@ -777,7 +800,7 @@ class AnalysisResult:
         y -= 8
 
         rows = _stage_pairs(stage_scores)
-        rows.append(("Final Score", score))
+        rows.append(("Final Score", raw_score if raw_score is not None else score))
 
         for k, (label, val) in enumerate(rows):
             bg = C_OFF_WHITE if k % 2 == 0 else C_WHITE
