@@ -20,9 +20,15 @@ os.makedirs(REPORT_FOLDER, exist_ok=True)
 # Max upload size (bytes) — 500MB, same as the original Colab server
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 
-# CORS — restrict this to your real frontend domain in production
-# (the Colab prototype used '*' for convenience; tighten before launch)
-ALLOWED_ORIGINS = os.environ.get("DFD_ALLOWED_ORIGINS", "*").split(",")
+# CORS — must NOT be '*' now that main.py sets allow_credentials=True (v6.0, for the
+# Authorization header). A wildcard origin combined with allow_credentials is rejected
+# outright by some Starlette/FastAPI versions, and even where it isn't, browsers will
+# refuse to expose the response to credentialed cross-origin requests either way.
+# Defaults to the real deployed frontend; override via DFD_ALLOWED_ORIGINS if that
+# domain changes (comma-separated for multiple origins, e.g. staging + prod).
+ALLOWED_ORIGINS = os.environ.get(
+    "DFD_ALLOWED_ORIGINS", "https://veritas-deepfake-detector.vercel.app"
+).split(",")
 
 IMAGE_FORMATS    = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp", ".mpo"}
 VIDEO_FORMATS    = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".webm", ".wmv"}
