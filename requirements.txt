@@ -19,3 +19,9 @@ scipy==1.13.1
 Pillow==10.4.0
 psutil
 piexif
+asyncpg>=0.29
+bcrypt>=4.1
+pyjwt>=2.8
+slowapi>=0.1.9
+stripe>=9.0
+python-magic>=0.4.27
