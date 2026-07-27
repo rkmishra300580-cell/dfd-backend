@@ -33,12 +33,40 @@ async def create_checkout_session(plan: str, user: dict = Depends(get_current_us
         mode="subscription",
         customer_email=user["email"],
         line_items=[{"price": PLAN_CONFIG[plan]["price_id"], "quantity": 1}],
-        success_url=os.environ["FRONTEND_URL"] + "/billing/success",
-        cancel_url=os.environ["FRONTEND_URL"] + "/billing/cancel",
+        # NOTE: the frontend is a single-page app (just app/page.js) with no separate
+        # /billing/success or /billing/cancel routes, so we redirect back to root with
+        # a query param instead — page.js reads ?billing=success|cancel on load.
+        success_url=os.environ["FRONTEND_URL"] + "/?billing=success",
+        cancel_url=os.environ["FRONTEND_URL"] + "/?billing=cancel",
         client_reference_id=user["id"],
         metadata={"internal_user_id": user["id"], "plan": plan},
     )
     return {"checkout_url": session.url}
+
+
+@router.get("/subscription")
+async def get_subscription(user: dict = Depends(get_current_user)):
+    """Current plan + usage, for the frontend to display (e.g. 'Free — 3/20 used this month')."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        sub = await conn.fetchrow(
+            "SELECT plan, status, monthly_quota, current_period_start FROM subscriptions WHERE user_id = $1",
+            user["id"],
+        )
+        if sub is None:
+            raise HTTPException(status_code=404, detail="No subscription found")
+
+        used = await conn.fetchval(
+            "SELECT count(*) FROM usage_records WHERE user_id = $1 AND created_at >= $2",
+            user["id"], sub["current_period_start"],
+        )
+
+    return {
+        "plan": sub["plan"],
+        "status": sub["status"],
+        "monthly_quota": sub["monthly_quota"],
+        "used_this_period": used,
+    }
 
 
 @router.post("/webhook")
