@@ -148,7 +148,12 @@ async def google_callback(code: str = None, state: str = None, error: str = None
             "redirect_uri": redirect_uri,
         })
         if token_res.status_code != 200:
-            raise HTTPException(status_code=502, detail="Google token exchange failed")
+            print(f"[oauth] Google token exchange failed: status={token_res.status_code} "
+                  f"redirect_uri={redirect_uri!r} body={token_res.text}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Google token exchange failed: {token_res.text}",
+            )
         access_token = token_res.json()["access_token"]
 
         userinfo_res = await client.get(
