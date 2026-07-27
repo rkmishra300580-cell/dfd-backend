@@ -30,6 +30,7 @@ from detector.pipeline import run_pipeline
 
 from db import init_db_pool, close_db_pool, get_pool
 from auth import router as auth_router, get_current_user
+from oauth import router as oauth_router
 from billing import router as billing_router
 from jobs import router as jobs_router, create_job, run_job
 from rate_limit import limiter, enforce_monthly_quota, record_usage, ANALYZE_PER_MINUTE
@@ -49,6 +50,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(oauth_router)
 app.include_router(billing_router)
 app.include_router(jobs_router)
 
