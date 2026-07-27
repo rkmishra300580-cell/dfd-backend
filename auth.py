@@ -177,7 +177,10 @@ async def login(body: LoginRequest):
         row = await conn.fetchrow(
             "SELECT id, password_hash, role FROM users WHERE email = $1", body.email
         )
-    if row is None or not verify_password(body.password, row["password_hash"]):
+    # row["password_hash"] can be NULL for OAuth-only accounts (see oauth.py) —
+    # check that explicitly, since bcrypt.checkpw() would raise on None rather
+    # than just failing the comparison.
+    if row is None or row["password_hash"] is None or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     token = create_access_token(str(row["id"]), row["role"])
