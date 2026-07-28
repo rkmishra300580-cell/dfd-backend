@@ -32,6 +32,7 @@ from transformers import pipeline as hf_pipeline
 
 from .result import AnalysisResult
 from .helpers import detect_faces, extract_fake_score, apply_graph_style
+from .router import classify_content_type
 
 # ============================================================================
 # DELIBERATE EXCEPTION to the "all models are permanent singletons" rule
@@ -1034,7 +1035,7 @@ def vehicle_damage_analysis(filepath, pil_image, R: AnalysisResult):
 # STAGE 5  -  Deep Learning Detector + Adaptive Fusion
 # ============================================================
 def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
-                vehicle_score, has_human_face, all_indicators,
+                vehicle_score, has_human_face, content_bucket, all_indicators,
                 freq_reliable, R: AnalysisResult):
 
     R.pdf_text('<b>Stage 5  -  Deep Learning Detector</b>', 'Heading1')
@@ -1161,11 +1162,20 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
     plt.close(fig)
 
     # -- Adaptive fusion ------------------------------------------
-    # DL model is trained on human face deepfakes.
-    # When no human face is present (vehicle, object), its weight is reduced
-    # and vehicle damage score takes a significant share.
-    if has_human_face:
-        # Standard human face image - UNCHANGED from before this fix.
+    # Fusion mode is now selected from content_bucket (router output),
+    # not the binary has_human_face flag. Three modes:
+    #   FACE    - unchanged from before this fix (DL deepfake model weighted heavily)
+    #   VEHICLE - unchanged from before this fix (vehicle damage + AI-gen weighted heavily)
+    #   OTHER   - NEW. No vehicle weight, no vehicle indicator. Everything
+    #             that isn't a face or a vehicle (documents, landscapes,
+    #             animals, screenshots, products, general scenes) now gets
+    #             its own weighting instead of being silently scored as a
+    #             vehicle. AI-gen ensemble carries the largest share since
+    #             it's the most subject-agnostic signal available; forensic/
+    #             manipulation cover traditional editing; DL deepfake model
+    #             keeps a small fallback weight since it's face-swap-trained
+    #             and only weakly relevant here.
+    if content_bucket == 'FACE':
         if not freq_reliable:
             w_forensic, w_manip, w_vehicle, w_dl = 0.15, 0.35, 0.00, 0.50
         else:
@@ -1173,15 +1183,16 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
         w_dl_ai           = 0.00  # not touched in this fix - see image_pipeline.py history
         dl_ai_for_fusion  = 0.0
         R.pdf_text('Fusion mode: FACE IMAGE  -  DL model weighted heavily.')
-    else:
-        # Vehicle / object image. EMERGENCY FIX: dl_ai_score (Phase 1's AI-
-        # generated-image detector) previously had ZERO weight here despite
-        # being the single most relevant signal for non-face content.
-        # Real incident: a ChatGPT-edited vehicle damage photo scored 98.7%
-        # on this signal and the final score still came out 32.4% ("LOW")
-        # because nothing read it. dl_deepfake_score's weight is reduced
-        # (not removed) here since that model is trained for face-swap
-        # detection and is a weaker signal for vehicle/object images.
+
+    elif content_bucket == 'VEHICLE':
+        # EMERGENCY FIX (predates this pass): dl_ai_score (AI-generated-image
+        # detector) previously had ZERO weight here despite being the single
+        # most relevant signal for non-face content. Real incident: a
+        # ChatGPT-edited vehicle damage photo scored 98.7% on this signal
+        # and the final score still came out 32.4% ("LOW") because nothing
+        # read it. dl_deepfake_score's weight is reduced (not removed) here
+        # since that model is trained for face-swap detection and is a
+        # weaker signal for vehicle images.
         w_forensic, w_manip, w_vehicle, w_dl, w_dl_ai = 0.10, 0.20, 0.30, 0.10, 0.30
 
         if dl_ai_score is None:
@@ -1194,7 +1205,25 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
             dl_ai_for_fusion = dl_ai_score
 
         R.pdf_text('Fusion mode: VEHICLE/OBJECT IMAGE  -  vehicle damage + AI-generation score weighted heavily, DL deepfake weight reduced.')
-        R.add_indicator('[Vehicle] Image contains no human face  -  vehicle damage forensics applied')
+        R.add_indicator('[Vehicle] Router classified image as vehicle content  -  vehicle damage forensics applied')
+
+    else:  # OTHER
+        w_forensic, w_manip, w_vehicle, w_dl, w_dl_ai = 0.15, 0.25, 0.00, 0.15, 0.45
+
+        if dl_ai_score is None:
+            # Graceful degradation: redistribute its weight onto manip_score
+            # (traditional-editing signal) instead of vehicle_score, since
+            # vehicle_score is always 0.0 for this bucket and redistributing
+            # onto it would be a silent no-op.
+            w_manip           += w_dl_ai
+            w_dl_ai            = 0.00
+            dl_ai_for_fusion   = 0.0
+        else:
+            dl_ai_for_fusion = dl_ai_score
+
+        R.pdf_text('Fusion mode: OTHER  -  router classified this as non-face, non-vehicle content. '
+                    'AI-generation ensemble and manipulation/forensic signals weighted; no vehicle-damage '
+                    'or face-specific stage applied.')
 
     final = float(np.clip(
         combined_forensic_score * w_forensic +
@@ -1209,7 +1238,7 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
     R.add_stat('Manipulation Score', f'{manip_score:.1f}%')
     R.add_stat('Vehicle Score',      f'{vehicle_score:.1f}%')
     R.add_stat('DL Score',           f'{fake_score:.1f}%')
-    R.add_stat('Fusion Mode',        'Face image' if has_human_face else 'Vehicle/object image')
+    R.add_stat('Fusion Mode',        content_bucket)
     # NOTE: this value is NOT the report's actual final score. pipeline.py
     # always calls classify_dominant() after analyze_image() returns, which
     # independently computes and overwrites payload['final_score'] via its
@@ -1561,7 +1590,31 @@ def analyze_image(filepath, R: AnalysisResult):
         'full body of evidence and verified by a qualified analyst.'
     )
 
-    # Stage 2: Face forensics (returns has_human_face flag)
+    # ── Content-type routing ─────────────────────────────────────────────
+    # Added 28 Jul 2026. Previously this pipeline only had a binary split:
+    # has_human_face (from Haar, computed inside face_forensic_analysis
+    # below) True/False, and EVERY False case — documents, landscapes,
+    # animals, screenshots, products, missed-face photos — was run through
+    # vehicle_damage_analysis() and fusion-weighted as if it were a car.
+    # That's what generated fabricated "damage" indicators on non-vehicle
+    # content. classify_content_type() (CLIP zero-shot) now makes an
+    # explicit 3-way call: FACE / VEHICLE / OTHER. When uncertain (low
+    # confidence, or FACE/VEHICLE score too close together), it defaults to
+    # OTHER — confirmed decision: safest failure mode, fewest false
+    # positives, since OTHER runs no type-specific stage at all.
+    router_result  = classify_content_type(pil_image)
+    content_bucket = router_result['bucket']
+    R.add_stat('Content Type',            content_bucket)
+    R.add_stat('Content Type Confidence', f"{router_result['confidence']:.2f}")
+    R.payload['content_bucket'] = content_bucket
+    R.pdf_text(
+        f"Content-type routing: classified as {content_bucket} "
+        f"(confidence {router_result['confidence']:.2f}) — {router_result['reason']}"
+    )
+
+    # Stage 2: Face forensics (returns has_human_face flag; combined_score
+    # also feeds the general forensic-score weight in fusion regardless of
+    # bucket — unchanged, this stage was never purely face-only internally)
     combined_score, all_indicators, has_human_face = face_forensic_analysis(
         filepath, pil_image, freq_score, freq_indicators, R
     )
@@ -1569,25 +1622,28 @@ def analyze_image(filepath, R: AnalysisResult):
     # Stage 3: Manipulation analysis (runs on all images)
     manip_score = manipulation_analysis(filepath, pil_image, R)
 
-    # Stage 4: Vehicle damage analysis (runs on all images, weighted in fusion only when no face)
-    vehicle_score = vehicle_damage_analysis(filepath, pil_image, R)
-
-    # The vehicle score is only meaningful (and only weighted >0 in fusion below)
-    # when no human face was detected. Suppress it from the displayed stage
-    # breakdown for face images so the frontend doesn't show a vehicle tab
-    # for portraits/faces  -  it would otherwise always be a non-null number.
-    if has_human_face:
+    # Stage 4: Vehicle damage analysis — NOW ONLY RUNS when the router says
+    # VEHICLE. This is the actual fix: previously this ran unconditionally
+    # and wrote indicators/report sections for every non-face image. For
+    # FACE and OTHER buckets it's skipped entirely — vehicle_score stays
+    # 0.0 and no vehicle-damage indicators, stats, or report graphs are
+    # produced for content that was never a vehicle.
+    if content_bucket == 'VEHICLE':
+        vehicle_score = vehicle_damage_analysis(filepath, pil_image, R)
+    else:
+        vehicle_score = 0.0
         R.payload['stage_scores'].pop('vehicle_damage', None)
 
-    # Store has_human_face in payload so pipeline.py can use it
-    # for indicator filtering — vehicle/insurance indicators must never
-    # appear when a human face was detected
+    # Store has_human_face in payload — still used by pipeline.py's
+    # indicator filtering for backward compatibility (unchanged there in
+    # this pass). content_bucket above is now the source of truth for
+    # fusion mode selection in dl_detector().
     R.payload['has_human_face'] = has_human_face
 
     # Stage 5: DL + adaptive fusion
     final_score = dl_detector(
         filepath, pil_image, combined_score, manip_score,
-        vehicle_score, has_human_face, all_indicators, freq_reliable, R
+        vehicle_score, has_human_face, content_bucket, all_indicators, freq_reliable, R
     )
 
     # ── No-EXIF corroboration check ─────────────────────────────────────────
