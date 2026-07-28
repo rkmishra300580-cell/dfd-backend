@@ -307,21 +307,30 @@ def classify_dominant(payload: dict) -> dict:
         # editing evidence (Photoshop/Lightroom tag + forensic corroboration)
         # is a SEPARATE, third signal checked here.
         #
-        # TAXONOMY CHANGE: previously this sub-classified as 'REAL (Edited)' -
-        # a REAL variant, not a synthetic classification. Per explicit product
-        # decision, any detected manipulation - AI-driven or manual/Photoshop -
-        # is now classified as DEEPFAKE, not REAL. 'DEEPFAKE' here is being
-        # used in the broader sense of "this image was manipulated," not only
-        # "face identity was swapped." manipulation_type distinguishes the two
-        # for anyone reading the report who needs to know which (e.g. an
-        # insurance investigator cares whether a claim photo was Photoshopped
-        # vs. face-swapped, even though both now show the same top-level badge).
+        # TAXONOMY CHANGE (28 Jul 2026): reversed the previous "all
+        # manipulation = DEEPFAKE" merge. Per explicit product decision,
+        # manual/Photoshop editing (no AI/deep learning involved) is once
+        # again classified as REAL (with editing_detected=True and its own
+        # 'REAL (Edited)' badge), separate from DEEPFAKE which is now
+        # reserved for AI-driven manipulation only (face-swap or AI-based
+        # editing of a real photo). manipulation_type still distinguishes
+        # 'EDITED' from 'FACE_SWAP'/'MANIPULATION' for anyone reading the
+        # report who needs to know which (e.g. an insurance investigator
+        # cares whether a claim photo was Photoshopped vs. AI face-swapped —
+        # they now show DIFFERENT top-level badges, matching that need).
+        #
+        # This matches a pre-existing frontend contract (app/page.js
+        # CLF_CONFIG.REAL_EDITED / editing_detected promotion logic) that
+        # was already built and shipped but unreachable, because this
+        # branch previously always returned classification='DEEPFAKE' —
+        # the REAL+editing_detected combination the frontend was waiting
+        # for could never actually occur. It's reachable now.
         editing_detected = (edit_composite >= EDITED_THRESHOLD)
         if editing_detected:
-            classification    = 'DEEPFAKE'
+            classification    = 'REAL'
             dominant_score    = edit_composite
             manipulation_type = 'EDITED'
-            dominant_label    = f'{dominant_score:.0f}% DEEPFAKE (Edited)'
+            dominant_label    = f'{dominant_score:.0f}% REAL (Edited)'
         else:
             classification    = 'REAL'
             dominant_score    = real_score
@@ -357,7 +366,12 @@ def classify_dominant(payload: dict) -> dict:
         editing_detected = False
 
     # ── Risk level ────────────────────────────────────────────────────────────
-    if classification == 'REAL':
+    # NOTE: 'REAL' no longer implies zero risk on its own — a REAL image with
+    # editing_detected=True (Photoshop/manual manipulation, e.g. an altered
+    # insurance claim photo) still needs a risk tier scaled to how strong the
+    # editing evidence is, same tiering as DEEPFAKE/AI_GENERATED. Only a
+    # genuinely clean REAL (no editing found) is unconditionally LOW.
+    if classification == 'REAL' and not editing_detected:
         risk_level = 'LOW'
     elif dominant_score < 50:
         risk_level = 'LOW'
@@ -378,7 +392,10 @@ def classify_dominant(payload: dict) -> dict:
     # text. There is no old frontend left that needs the old remapped range;
     # making these the same value by construction is what actually fixes that,
     # not just narrowing the gap between two still-separate formulas.
-    if classification == 'REAL':
+    # Same editing_detected carve-out as risk_level above: a REAL+edited image
+    # should report its edit-evidence strength (dominant_score = edit_composite),
+    # not the low synthetic_score that this branch exists for pure-REAL images.
+    if classification == 'REAL' and not editing_detected:
         legacy_score = round(synthetic_score, 1)
     else:
         legacy_score = dominant_score
@@ -392,8 +409,8 @@ def classify_dominant(payload: dict) -> dict:
         'ai_generated_score':  round(ai_gen_composite, 1),
         'deepfake_score':      round(deepfake_composite, 1),
         'edited_score':        round(edit_composite, 1),   # editing signal strength
-        'editing_detected':    editing_detected,  # True → classification is DEEPFAKE via the editing track specifically
-        'manipulation_type':   manipulation_type, # 'FACE_SWAP' | 'MANIPULATION' | 'EDITED' | None (REAL/AI_GENERATED) - which evidence drove a DEEPFAKE classification, since 'DEEPFAKE' now covers both identity manipulation and manual/AI editing
+        'editing_detected':    editing_detected,  # True → classification is REAL via the editing track specifically ("REAL (Edited)"), not a synthetic classification
+        'manipulation_type':   manipulation_type, # 'FACE_SWAP' | 'MANIPULATION' | 'EDITED' | None — 'EDITED' now pairs with classification='REAL'; 'FACE_SWAP'/'MANIPULATION' pair with classification='DEEPFAKE'
         'risk_level':          risk_level,
         # ── Updated legacy fields ─────────────────────────────────────────────
         'final_score':         round(legacy_score, 1),
@@ -421,22 +438,23 @@ def filter_indicators(indicators: list, classification: str,
         images regardless of classification, and vice versa.
 
       Pass 2 — Classification gate
-        REAL         → keep only indicators that support authenticity
-                       (in practice almost none fire for REAL verdicts)
+        REAL         → keep only indicators that support authenticity;
+                       EXCEPTION: if manipulation_type=='EDITED' (REAL with
+                       editing_detected=True, i.e. "REAL (Edited)"), keep
+                       the [EXIF]/[Manipulation] editing-evidence tags
+                       (ELA/PRNU/copy-move/editing-software) instead of
+                       returning an empty list — that evidence is exactly
+                       what earned the "(Edited)" qualifier and must not be
+                       silently dropped.
         DEEPFAKE     → manipulation_type distinguishes which evidence to keep:
                        'FACE_SWAP'/'MANIPULATION' → [Face], [Manipulation],
-                       [DL] identity-manipulation signals (unchanged from
-                       before this classification also covered editing).
-                       'EDITED' → [EXIF] editing-software tag, [Manipulation]
-                       forensics (ELA/PRNU/copy-move) - the evidence that
-                       actually drove this classification. Was previously
-                       unreachable dead code: the REAL branch above caught
-                       and returned [] for every REAL case unconditionally,
-                       before a same-condition `elif classification == 'REAL'`
-                       further down could ever run - so "REAL (Edited)"
-                       reports always showed zero indicators regardless of
-                       what evidence was found. Now reachable, since editing
-                       evidence classifies as DEEPFAKE, not REAL.
+                       [DL] identity-manipulation signals.
+                       'EDITED' → same tags as the REAL/'EDITED' case above,
+                       kept here only as a defensive fallback — as of
+                       28 Jul 2026 this combination (classification=
+                       DEEPFAKE + manipulation_type=EDITED) should not
+                       normally occur, since editing now classifies as REAL.
+                       See classify_dominant()'s 28 Jul 2026 taxonomy note.
         AI_GENERATED → keep [Frequency], [EXIF] AI-gen signals, [Vehicle]
                        (already gated out for face images in Pass 1).
                        Drop [Face] deepfake signals.
@@ -503,22 +521,40 @@ def filter_indicators(indicators: list, classification: str,
         if indicator.startswith('[Document]'): return 'DOCUMENT'
         return 'IMAGE'
 
+    # Shared with the DEEPFAKE/'EDITED' defensive fallback below — the actual
+    # evidence tags that support an editing finding regardless of which
+    # top-level classification carries it.
+    EDITED_TAGS = ['[EXIF]', '[Manipulation]', 'editing software',
+                   'ELA', 'PRNU', 'copy-move', 'patch', 'metadata']
+
     if classification == 'REAL':
-        # For REAL verdicts the indicator list is typically empty after Pass 1.
-        # Any remaining indicators are borderline — suppress them all so the
-        # user isn't confused by low-confidence noise on a REAL result.
+        if manipulation_type == 'EDITED':
+            # REAL (Edited): keep the evidence that actually drove this —
+            # EXIF editing-software tag + manipulation forensics (ELA/PRNU/
+            # copy-move) — same tag set as the old DEEPFAKE/'EDITED' path
+            # used, just reachable from the REAL branch now that editing
+            # classifies as REAL. Getting this wrong here would silently
+            # reproduce the exact "REAL (Edited) always shows zero
+            # indicators" bug this file's own history already had once,
+            # in the opposite direction — see 28 Jul 2026 taxonomy note in
+            # classify_dominant().
+            return [i for i in indicators if _matches(i, EDITED_TAGS)]
+        # Genuinely clean REAL: indicator list is typically empty after
+        # Pass 1 anyway. Any remaining indicators are borderline — suppress
+        # them all so the user isn't confused by low-confidence noise on a
+        # REAL result.
         return []
 
     elif classification == 'DEEPFAKE':
-        EDITED_TAGS = ['[EXIF]', '[Manipulation]', 'editing software',
-                       'ELA', 'PRNU', 'copy-move', 'patch', 'metadata']
         result = []
         for i in indicators:
             mod = _modality(i)
             if manipulation_type == 'EDITED':
-                # Editing-track DEEPFAKE: keep the evidence that actually
-                # drove this (EXIF editing tag + manipulation forensics),
-                # not face/identity-manipulation signals.
+                # Defensive fallback only — as of 28 Jul 2026, editing
+                # evidence classifies as REAL (see above), not DEEPFAKE, so
+                # this combination should not normally occur. Kept in case
+                # a future scoring change reintroduces it, so indicators
+                # don't silently disappear again if it does.
                 keep = _matches(i, EDITED_TAGS)
             elif mod == 'VIDEO':
                 keep = _matches(i, VIDEO_DEEPFAKE_TAGS)
@@ -559,9 +595,10 @@ def verdict_text_v2(classification: str, dominant_score: float,
     a real camera" doesn't make sense for a document, and image-style
     "face-swapping" language doesn't fit a cloned voice.
     manipulation_type=='EDITED' produces distinct 'this was edited, not
-    face-swapped/AI-generated' language within the DEEPFAKE branch - the
-    top-level classification is the same (DEEPFAKE), but a reader still
-    needs to know which kind of manipulation was actually found.
+    face-swapped/AI-generated' language within the REAL branch - as of
+    28 Jul 2026 the top-level classification is REAL (not DEEPFAKE) for
+    manual/non-AI editing; a reader still needs to know editing evidence
+    was found even though the badge says REAL.
     """
     score_str = f'{dominant_score:.0f}/100'
 
@@ -579,9 +616,17 @@ def verdict_text_v2(classification: str, dominant_score: float,
     }
 
     if classification == 'REAL':
-        # editing_detected can never be True here — editing evidence now
-        # classifies as DEEPFAKE (see manipulation_type=='EDITED' below),
-        # not as a REAL sub-variant.
+        if editing_detected and manipulation_type == 'EDITED':
+            return (
+                f'Forensic analysis detected evidence of editing or post-processing '
+                f'(score {score_str}) - for example colour grading, retouching, cloning, '
+                f'or other manipulation-software traces. This differs from face-swapping '
+                f'or AI-generated content: the underlying media appears to originate from '
+                f'a real source that was subsequently altered by conventional (non-AI) '
+                f'means, rather than being synthetically generated or having an identity '
+                f'substituted. This assessment is based on automated forensic analysis '
+                f'and should be verified by a qualified analyst before being used as evidence.'
+            )
         return (
             'No significant indicators of synthetic manipulation were detected. '
             'Content appears consistent with authentic, unedited media under '
@@ -589,6 +634,10 @@ def verdict_text_v2(classification: str, dominant_score: float,
         )
     elif classification == 'DEEPFAKE':
         if manipulation_type == 'EDITED':
+            # Defensive fallback only - as of 28 Jul 2026 this combination
+            # should not normally occur (editing now classifies as REAL,
+            # handled above). Kept so verdict text doesn't silently
+            # mismatch the indicator list if this state is ever reached.
             return (
                 f'Forensic analysis detected evidence of editing or post-processing '
                 f'(score {score_str}) - for example colour grading, retouching, cloning, '
