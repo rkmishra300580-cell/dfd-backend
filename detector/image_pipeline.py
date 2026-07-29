@@ -641,19 +641,73 @@ def manipulation_analysis(filepath, pil_image, R: AnalysisResult):
         if len(patch_scores) > 4:
             stds     = [p['std'] for p in patch_scores]
             ffts     = [p['fft'] for p in patch_scores]
-            std_mean, std_std = np.mean(stds), np.std(stds)
-            fft_mean, fft_std = np.mean(ffts), np.std(ffts)
+            # ROBUSTNESS FIX (29 Jul 2026, found while testing the cliff fix
+            # above): mean/std are not robust to contamination - if a real
+            # edit affects a large-enough fraction of patches, those very
+            # patches inflate std_mean/std_std (the "normal" reference),
+            # which can mask them from ever reading as outliers at all.
+            # Reproduced directly: injecting a 68/448 (15%) synthetic shift
+            # inflated combined std from 4.75 (base-only) to 7.19 - enough to
+            # swallow the injected shift and prevent correct detection. This
+            # affected the OLD cliff-based code equally; it's a statistic-
+            # robustness issue, not something the cliff-vs-continuous scoring
+            # question introduced. Median/MAD (median absolute deviation) has
+            # a ~50% breakdown point vs mean/std's ~0% - up to half the
+            # patches can be genuinely anomalous before the reference itself
+            # gets dragged away from the true baseline. 1.4826x is the
+            # standard MAD->std-equivalent scaling constant for a normal
+            # distribution, so the 2.5-sigma-equivalent threshold below stays
+            # comparable in scale to the old std-based one.
+            std_median = np.median(stds)
+            fft_median = np.median(ffts)
+            std_mad = np.median(np.abs(np.array(stds) - std_median))
+            fft_mad = np.median(np.abs(np.array(ffts) - fft_median))
+            std_std_safe = max(std_mad * 1.4826, 1e-6)
+            fft_std_safe = max(fft_mad * 1.4826, 1e-6)
 
-            outlier_patches = [
-                p for p in patch_scores
-                if abs(p['std'] - std_mean) > 2.5 * std_std
-                or abs(p['fft'] - fft_mean) > 2.5 * fft_std
-            ]
+            # per-patch anomaly strength in units of "how many multiples of the
+            # 2.5-sigma detection threshold" - used below for weighting, not just
+            # a binary in/out flag.
+            for p in patch_scores:
+                p['z_std'] = abs(p['std'] - std_median) / std_std_safe
+                p['z_fft'] = abs(p['fft'] - fft_median) / fft_std_safe
+                p['strength'] = max(p['z_std'], p['z_fft']) / 2.5   # 1.0 == right at threshold
+
+            outlier_patches = [p for p in patch_scores if p['strength'] >= 1.0]
             outlier_ratio = len(outlier_patches) / len(patch_scores)
 
-            patch_incon_score = 0.0
-            if outlier_ratio > 0.15:
-                patch_incon_score = min(outlier_ratio * 200, 70)
+            # BUG FIX (29 Jul 2026, found from a live false-negative on a
+            # confirmed real photo with a local AI inpaint/retouch, faces
+            # untouched): this used to be a hard cliff -
+            #     patch_incon_score = min(outlier_ratio*200, 70) if outlier_ratio > 0.15 else 0.0
+            # A fraud-relevant AI edit typically alters ONE small region, not
+            # 15% of the whole photo - the live case had 10/448 (2.2%) patches
+            # flagged as genuine >2.5-sigma outliers and scored a flat ZERO,
+            # discarding real signal entirely because it didn't clear an
+            # arbitrary area threshold. Replaced with continuous scoring:
+            #   - NOISE_FLOOR subtracted from outlier_ratio before scaling,
+            #     since ~1-2% of patches flagging by chance alone is expected
+            #     from two OR'd 2.5-sigma tests across hundreds of patches on
+            #     a genuinely clean image - don't manufacture signal from that.
+            #   - strength_factor (mean of how many multiples of the 2.5-sigma
+            #     threshold the flagged patches actually reached, capped 3x)
+            #     multiplies the result, so a SMALL region that is VERY
+            #     anomalous (a tightly-localized edit) can still score
+            #     meaningfully even at a low outlier_ratio - previously that
+            #     signal was invisible below 15% no matter how extreme it was.
+            #   - Calibrated so a borderline case at the old 15% boundary with
+            #     average-strength outliers scores ~30, matching the old
+            #     cliff's value at that same point (no regression for the
+            #     large-area-edit cases the old code did catch).
+            NOISE_FLOOR = 0.015
+            effective_ratio = max(0.0, outlier_ratio - NOISE_FLOOR)
+            strength_factor = 1.0
+            if outlier_patches:
+                mean_strength = float(np.mean([p['strength'] for p in outlier_patches]))
+                strength_factor = min(mean_strength, 3.0)
+            patch_incon_score = min(effective_ratio * 220 * strength_factor, 70)
+
+            if outlier_patches:
                 indicators.append(f'Patch inconsistency: {len(outlier_patches)}/{len(patch_scores)} outlier patches')
 
             component_scores['patch'] = patch_incon_score
@@ -666,9 +720,7 @@ def manipulation_analysis(filepath, pil_image, R: AnalysisResult):
                 r_idx = p['y'] // patch_size
                 c_idx = p['x'] // patch_size
                 if r_idx < rows and c_idx < cols:
-                    is_out = (abs(p['std'] - std_mean) > 2.5 * std_std
-                              or abs(p['fft'] - fft_mean) > 2.5 * fft_std)
-                    heatmap_data[r_idx, c_idx] = 1.0 if is_out else 0.0
+                    heatmap_data[r_idx, c_idx] = 1.0 if p['strength'] >= 1.0 else 0.0
 
             fig, axes = plt.subplots(1, 2, figsize=(12, 5))
             axes[0].imshow(pil_image.convert('RGB')); axes[0].set_title('Original', color='#c9d1d9'); axes[0].axis('off')
