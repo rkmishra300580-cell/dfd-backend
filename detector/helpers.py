@@ -73,7 +73,7 @@ DL_AI_CONCLUSIVE_THRESHOLD = 90.0
 # then applies the SAME shared decision logic / risk_level / legacy mapping
 # / verdict text regardless of modality - only the composite math differs.
 
-def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
+def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: bool = None) -> tuple:
     """
     Each composite uses per-model floors (DL_DEEPFAKE_FLOOR / DL_AI_FLOOR).
     strongest_single_component) - a general dominant-signal floor so one
@@ -84,6 +84,20 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
     This replaces an earlier version that only floored ai_gen_composite, and
     only when dl_ai >= 85 specifically - a real case with dl_ai=84.4 fell
     just short of that threshold and got no protection at all.
+
+    BUG FIX (29 Jul 2026): has_face used to be silently overwritten two lines
+    into this function (`has_face = face is not None`), making the has_face
+    PARAMETER dead code regardless of what any caller passed in. Found via a
+    live false-negative on a confirmed AI-generated vehicle-damage photo,
+    where a Haar false-positive ("face" detected on a wheel/headlight) leaked
+    straight into deepfake_composite's weighting formula even though the
+    router had already correctly classified the image as VEHICLE - because
+    classify_dominant()'s attempt to pass the router's decision in here had
+    no effect; this function threw the passed value away immediately.
+    has_face/has_vehicle are now genuinely caller-controlled. has_vehicle
+    defaults to re-deriving from stage-key presence only when the caller
+    doesn't specify it (legacy/non-routed callers) - not silently overridden
+    once specified.
     """
     dl_deepfake  = float(stage.get('deep_learning',   0) or 0)
     dl_ai        = float(stage.get('dl_ai_generated', 0) or 0)
@@ -104,8 +118,8 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
     exif_edit    = float(stage.get('exif_edit_score',  0) or 0)
     exif_real    = float(stage.get('exif_real_score',  0) or 0)
 
-    has_face    = face    is not None
-    has_vehicle = vehicle is not None
+    if has_vehicle is None:
+        has_vehicle = vehicle is not None   # fallback only - legacy/non-routed callers
 
     EXIF_CONCLUSIVE_AI   = 70.0
     EXIF_CONCLUSIVE_REAL = 65.0
@@ -119,8 +133,9 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
         # Raising DL weight also reduces false-positive risk on real portraits:
         # when DL correctly scores low (~20%), the composite drops vs before
         # even if the Haar score is high (e.g. sharp/symmetric face region).
-        deepfake_components = [dl_deepfake, float(face)]
-        deepfake_composite  = dl_deepfake * 0.70 + float(face) * 0.10 + manip * 0.20
+        face_val = float(face) if face is not None else 0.0
+        deepfake_components = [dl_deepfake, face_val]
+        deepfake_composite  = dl_deepfake * 0.70 + face_val * 0.10 + manip * 0.20
     else:
         deepfake_components = [manip, dl_deepfake]
         deepfake_composite  = manip * 0.70 + dl_deepfake * 0.30
@@ -130,8 +145,9 @@ def _compute_image_composites(stage: dict, has_face: bool = True) -> tuple:
         # dl_ai raised 0.30→0.45: sdxl-detector is the primary signal for
         # non-face images; at 0.30 a 98% score was being drowned out by
         # lower-scoring forensic sub-components.
-        ai_gen_components = [dl_ai, freq, float(vehicle), exif_ai]
-        ai_gen_composite  = dl_ai * 0.45 + freq * 0.20 + float(vehicle) * 0.20 + exif_ai * 0.15
+        vehicle_val = float(vehicle) if vehicle is not None else 0.0
+        ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai]
+        ai_gen_composite  = dl_ai * 0.45 + freq * 0.20 + vehicle_val * 0.20 + exif_ai * 0.15
     else:
         ai_gen_components = [dl_ai, freq, exif_ai]
         ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
@@ -278,10 +294,41 @@ def classify_dominant(payload: dict) -> dict:
     Dominant score = confidence in the winning class (0-100).
     This is what the frontend shows as the headline number.
     """
-    stage     = payload.get('stage_scores', {})
-    file_type = payload.get('file_type', 'IMAGE')
+    stage          = payload.get('stage_scores', {})
+    file_type      = payload.get('file_type', 'IMAGE')
+    content_bucket = payload.get('content_bucket')  # set by router.py for IMAGE only, since 28 Jul 2026
 
-    if   file_type == 'IMAGE'    : deepfake_composite, ai_gen_composite, edit_composite = _compute_image_composites(stage, has_face=stage.get('face_forensics') is not None)
+    if file_type == 'IMAGE':
+        # BUG FIX (29 Jul 2026, found from a live false-negative on a
+        # confirmed AI-generated vehicle-damage photo): this used to read
+        # raw Haar output (`stage.get('face_forensics') is not None`)
+        # directly, completely independent of the router's content_bucket
+        # decision made in image_pipeline.py. Haar false-positived a "face"
+        # on the car's wheel/headlight (a known Haar failure mode - dark
+        # circular/textured regions), which made this function compute
+        # deepfake_composite using the FACE-weighted formula
+        # (dl_deepfake*0.70 + face*0.10 + manip*0.20) instead of the
+        # correct VEHICLE-content formula (manip*0.70 + dl_deepfake*0.30) -
+        # even though the router had already correctly classified the
+        # image as VEHICLE. Two independent fusion pathways
+        # (dl_detector's adaptive fusion in image_pipeline.py, and this
+        # function) each had their own face/vehicle determination, and
+        # only one of them got wired to the router in the original routing
+        # fix. has_face here is now derived from content_bucket when the
+        # router has run, falling back to raw Haar output only for older
+        # payloads that predate routing (should not occur in practice
+        # post-deploy, kept defensively).
+        has_face_for_composite = (
+            (content_bucket == 'FACE') if content_bucket is not None
+            else (stage.get('face_forensics') is not None)
+        )
+        has_vehicle_for_composite = (
+            (content_bucket == 'VEHICLE') if content_bucket is not None
+            else None  # let _compute_image_composites fall back to stage-key presence
+        )
+        deepfake_composite, ai_gen_composite, edit_composite = _compute_image_composites(
+            stage, has_face=has_face_for_composite, has_vehicle=has_vehicle_for_composite
+        )
     elif file_type == 'VIDEO'    : deepfake_composite, ai_gen_composite, edit_composite = _compute_video_composites(stage)
     elif file_type == 'AUDIO'    : deepfake_composite, ai_gen_composite, edit_composite = _compute_audio_composites(stage)
     elif file_type == 'DOCUMENT' : deepfake_composite, ai_gen_composite, edit_composite = _compute_document_composites(stage)
