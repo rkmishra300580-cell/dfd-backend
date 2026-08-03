@@ -59,6 +59,20 @@ AI_GEN_THRESHOLD     = 45.0
 # instead of the real 45-point AI_GEN_THRESHOLD wrongly suggested 0.70.
 DL_DEEPFAKE_FLOOR = 0.80   # prithivMLmods — validated, face-specific, high trust
 DL_AI_FLOOR       = 0.60   # sdxl-detector ensemble — unvalidated, lower trust
+# NEW 29 Jul 2026: vehicle_damage_analysis's own heuristics (ELA/shadow/
+# texture/boundary/insurance-metadata) are the most directly relevant signal
+# for vehicle-bucket images, same role dl_deepfake plays for faces - but
+# unlike the DL scores, nothing floored it against dilution by weak,
+# unrelated components (dl_ai in particular - see the 29 Jul false-negative
+# where vehicle_score=60.9 legitimately elevated but ai_gen_composite only
+# reached 29.5 because dl_ai=27.1 dragged it down at 0.45 weight). This
+# constant is UNVALIDATED - chosen to match DL_AI_FLOOR's conservative value
+# as a reasoned default, not fit to any labeled case. It does NOT flip that
+# specific case to correctly-classified (60.9*0.60=36.5, still under
+# AI_GEN_THRESHOLD=45.0) - deliberately not tuned to do so, since picking a
+# value that would is fitting one example, not calibrating. The real fix is
+# running this against evaluate.py on a real labeled set once one exists.
+VEHICLE_FLOOR     = 0.60   # vehicle_damage_analysis — unvalidated, needs evaluate.py calibration
 # When EITHER ensemble member alone reports confidence at/above this, treat
 # it as near-conclusive (see the ceiling applied in _compute_image_composites
 # below) rather than letting the ensemble MEAN dilute it. Only fires on the
@@ -152,6 +166,8 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
         ai_gen_components = [dl_ai, freq, exif_ai]
         ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
     ai_gen_composite = max(ai_gen_composite, dl_ai * DL_AI_FLOOR)
+    if has_vehicle:
+        ai_gen_composite = max(ai_gen_composite, vehicle_val * VEHICLE_FLOOR)
 
     # ── Conclusive-evidence boosts ──────────────────────────────────────────
     # Three separate mechanisms below each say "if ONE signal is extremely
@@ -418,9 +434,17 @@ def classify_dominant(payload: dict) -> dict:
     # insurance claim photo) still needs a risk tier scaled to how strong the
     # editing evidence is, same tiering as DEEPFAKE/AI_GENERATED. Only a
     # genuinely clean REAL (no editing found) is unconditionally LOW.
+    #
+    # BUG FIX (31 Jul 2026, found from a live case): the old bands had
+    # `dominant_score < 50 -> LOW`, which overlapped with AI_GEN_THRESHOLD
+    # (45.0) - a confirmed AI_GENERATED classification at e.g. 46.3% showed
+    # "LOW risk" despite being a positive finding, because 46.3 < 50. Any
+    # classification that reaches this branch (AI_GENERATED, DEEPFAKE, or
+    # REAL+edited) already crossed its own suspicion threshold (40-50 range
+    # depending on class) to get classified that way in the first place -
+    # LOW is never the right tier for a confirmed positive finding,
+    # regardless of exactly how far past its threshold the score landed.
     if classification == 'REAL' and not editing_detected:
-        risk_level = 'LOW'
-    elif dominant_score < 50:
         risk_level = 'LOW'
     elif dominant_score < 65:
         risk_level = 'MODERATE'
