@@ -142,6 +142,32 @@ def _extract_ai_generated_score(label_map: dict) -> tuple:
     raise ValueError(f'Unrecognized sdxl-detector label scheme: {list(label_map.keys())}')
 
 
+def _update_stat(R: AnalysisResult, label: str, value):
+    """
+    Update an existing R.payload['stats'] entry in place, by label, instead
+    of appending a duplicate row.
+
+    ADDED (3 Aug 2026) alongside the EXIF-display-sync fix below.
+    AnalysisResult.add_stat() (detector/result.py) unconditionally APPENDS
+    to a list (`self.payload["stats"].append(...)`) - it has no concept of
+    "update this label's value." Calling add_stat() again for a label that
+    was already set earlier in the pipeline (e.g. 'EXIF AI Score', set once
+    in exif_analysis() and needing correction after a later block mutates
+    the underlying score) would silently produce TWO rows with the same
+    label and different values in the same report, which is worse than the
+    original staleness bug it was meant to fix - confirmed by reading
+    result.py directly rather than assuming overwrite semantics.
+    Falls back to a normal append only if the label isn't already present
+    (defensive - should not happen at the two call sites this is used from,
+    since both run after exif_analysis() has already added the stat once).
+    """
+    for entry in R.payload['stats']:
+        if entry.get('label') == label:
+            entry['value'] = str(value)
+            return
+    R.add_stat(label, value)
+
+
 # ============================================================
 # STAGE 1  -  Frequency Domain Analysis
 # ============================================================
@@ -1626,6 +1652,19 @@ def analyze_image(filepath, R: AnalysisResult):
         exif_result['exif_ai_score']   = max(exif_result['exif_ai_score'],   55.0)
         R.payload['stage_scores']['exif_real_score'] = round(exif_result['exif_real_score'], 1)
         R.payload['stage_scores']['exif_ai_score']   = round(exif_result['exif_ai_score'],   1)
+        # DISPLAY-SYNC FIX (3 Aug 2026): the 'EXIF AI Score' stat shown in the
+        # report is set once by exif_analysis() and was never refreshed when
+        # this block (or the no-EXIF-corroboration block below) mutates the
+        # underlying stage_scores value afterward. Found via a real case
+        # (bdfd09aadb9a) where the report displayed "EXIF AI Score: 25" in
+        # the metrics table while the verdict prose correctly said "70%" and
+        # classify_dominant() used 70 in ai_gen_composite - two numbers for
+        # the same field, disagreeing, in the same report. Uses _update_stat
+        # (not add_stat) to correct the existing row in place rather than
+        # appending a second, duplicate 'EXIF AI Score' entry - add_stat()
+        # has no overwrite semantics (confirmed by reading result.py).
+        # This is a display fix only; it changes no scoring math or thresholds.
+        _update_stat(R, 'EXIF AI Score', f'{exif_result["exif_ai_score"]:.0f}')
 
     # ── Methodology disclaimer (PDF only) ────────────────────────────────────
     # Agreed wording (Option 3): frames the EXIF cross-check as standard
@@ -1754,6 +1793,19 @@ def analyze_image(filepath, R: AnalysisResult):
                 f'No-EXIF corroboration: dl_ai_generated={dl_ai_for_corroboration}, freq_score={freq_score:.1f} '
                 f'- at least one independent signal supports the no-metadata finding, so its contribution was restored.'
             )
+            # DISPLAY-SYNC FIX (3 Aug 2026): same staleness bug as the noise-
+            # contradiction block above - this corroboration boost updates
+            # stage_scores['exif_ai_score'] (used in classify_dominant()'s
+            # math) but never refreshed the report-facing stat, which was
+            # still showing exif_analysis()'s original pre-corroboration
+            # value. Confirmed against bdfd09aadb9a and f5e59f773f15: both
+            # showed "EXIF AI Score: 25" in the metrics table while the
+            # verdict prose correctly said "70%" (which classify_dominant()
+            # actually used). Uses _update_stat, not add_stat, for the same
+            # reason as above - add_stat() would append a duplicate row
+            # rather than correct the existing one. Display fix only - no
+            # scoring/threshold change.
+            _update_stat(R, 'EXIF AI Score', f'{exif_result["exif_ai_score"]:.0f}')
         else:
             R.pdf_text(
                 f'No-EXIF finding NOT corroborated by other signals (dl_ai_generated={dl_ai_for_corroboration}, '
