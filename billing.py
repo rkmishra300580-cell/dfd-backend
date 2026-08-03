@@ -104,7 +104,7 @@ async def stripe_webhook(request: Request):
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                UPDATE subscriptions SET plan = 'free', monthly_quota = 20, status = 'canceled', updated_at = now()
+                UPDATE subscriptions SET plan = 'free', monthly_quota = 200, status = 'canceled', updated_at = now()
                 WHERE stripe_subscription_id = $1
                 """,
                 subscription["id"],
