@@ -471,6 +471,17 @@ def classify_dominant(payload: dict) -> dict:
     else:
         legacy_score = dominant_score
 
+    # verdict_text_v2() now returns a dict (4 Aug 2026 - see its own
+    # docstring) instead of a bare string, so it's called once here and
+    # unpacked into three payload fields rather than assigned directly to
+    # 'verdict'.
+    _verdict_fields = verdict_text_v2(classification, dominant_score,
+                                       deepfake_composite, ai_gen_composite,
+                                       file_type=file_type,
+                                       editing_detected=editing_detected,
+                                       manipulation_type=manipulation_type,
+                                       risk_level=risk_level)
+
     return {
         # ── New fields (dominant classification) ──────────────────────────────
         'classification':      classification,
@@ -486,12 +497,15 @@ def classify_dominant(payload: dict) -> dict:
         # ── Updated legacy fields ─────────────────────────────────────────────
         'final_score':         round(legacy_score, 1),
         'threat_level':        threat_from_score(legacy_score),
-        'verdict':             verdict_text_v2(classification, dominant_score,
-                                               deepfake_composite, ai_gen_composite,
-                                               file_type=file_type,
-                                               editing_detected=editing_detected,
-                                               manipulation_type=manipulation_type),
+        'verdict':             _verdict_fields['verdict'],
+        # NEW (4 Aug 2026): additive fields for the frontend to render a
+        # distinct callout/action element instead of just the paragraph.
+        # Both may be None - that's expected (e.g. plain REAL has no
+        # highlight sentence and, at LOW risk, no recommended action).
+        'verdict_highlight':   _verdict_fields['verdict_highlight'],
+        'recommended_action':  _verdict_fields['recommended_action'],
     }
+
 
 
 def filter_indicators(indicators: list, classification: str,
@@ -655,11 +669,27 @@ def filter_indicators(indicators: list, classification: str,
     return indicators
 
 
+def _recommended_action_line(risk_level: str) -> str:
+    """
+    Risk-scaled next-action sentence, appended to the verdict for any
+    result that isn't a clean REAL (risk_level == 'LOW'). Kept in the same
+    cautious, non-definitive register as the rest of verdict_text_v2 -
+    "recommended", never "must" or "do not approve" - this is guidance for
+    a human reviewer, not an automated denial.
+    """
+    return {
+        'MODERATE': 'Recommended next step: a manual review before this result is relied on for a claim decision.',
+        'HIGH':     'Recommended next step: review by a forensic analyst before this result is used in a claim decision.',
+        'CRITICAL': 'Recommended next step: this result should not be used to approve or deny a claim without manual forensic review first.',
+    }.get(risk_level)
+
+
 def verdict_text_v2(classification: str, dominant_score: float,
                     deepfake_score: float, ai_gen_score: float,
                     file_type: str = 'IMAGE',
                     editing_detected: bool = False,
-                    manipulation_type: str = None) -> str:
+                    manipulation_type: str = None,
+                    risk_level: str = None) -> dict:
     """
     Legally safe verdict language tied to dominant classification.
     Avoids definitive statements. Phrasing is modality-aware - "captured by
@@ -670,8 +700,29 @@ def verdict_text_v2(classification: str, dominant_score: float,
     28 Jul 2026 the top-level classification is REAL (not DEEPFAKE) for
     manual/non-AI editing; a reader still needs to know editing evidence
     was found even though the badge says REAL.
+
+    CHANGED (4 Aug 2026): returns a dict instead of a bare string -
+    {'verdict', 'verdict_highlight', 'recommended_action'} - additive, not
+    a breaking rename: 'verdict' still holds the exact same full paragraph
+    text as before (now with the recommended_action sentence appended when
+    risk_level warrants one, so PDF and any plain-text consumer gets it for
+    free with zero PDF-layout changes needed). The two new keys are for
+    consumers (the frontend) that want to render a distinct emphasized
+    callout instead of just a paragraph:
+      verdict_highlight   - the single most reassuring/important sentence,
+                             pulled out verbatim from 'verdict' (currently
+                             only set for REAL+Edited - the sentence
+                             clarifying "real source, conventionally
+                             altered, not AI" is the one point most worth
+                             a user's immediate attention). None otherwise.
+      recommended_action  - the same risk-scaled action sentence that's
+                             already appended into 'verdict', exposed
+                             separately so the frontend can style it as its
+                             own "next step" element if desired. None for
+                             risk_level == 'LOW' (nothing to recommend).
     """
     score_str = f'{dominant_score:.0f}/100'
+    action = _recommended_action_line(risk_level)
 
     DEEPFAKE_PHRASING = {
         'IMAGE':    'possible face-swapping, identity substitution, or targeted synthetic alteration of authentic source media',
@@ -686,19 +737,27 @@ def verdict_text_v2(classification: str, dominant_score: float,
         'DOCUMENT': 'an AI text generation tool rather than written by a human author',
     }
 
+    def _finish(text: str, highlight: str = None) -> dict:
+        full = f'{text} {action}' if action else text
+        return {'verdict': full, 'verdict_highlight': highlight, 'recommended_action': action}
+
     if classification == 'REAL':
         if editing_detected and manipulation_type == 'EDITED':
-            return (
+            highlight = (
+                'This differs from face-swapping or AI-generated content: the underlying '
+                'media appears to originate from a real source that was subsequently '
+                'altered by conventional (non-AI) means, rather than being synthetically '
+                'generated or having an identity substituted.'
+            )
+            return _finish(
                 f'Forensic analysis detected evidence of editing or post-processing '
                 f'(score {score_str}) - for example colour grading, retouching, cloning, '
-                f'or other manipulation-software traces. This differs from face-swapping '
-                f'or AI-generated content: the underlying media appears to originate from '
-                f'a real source that was subsequently altered by conventional (non-AI) '
-                f'means, rather than being synthetically generated or having an identity '
-                f'substituted. This assessment is based on automated forensic analysis '
-                f'and should be verified by a qualified analyst before being used as evidence.'
+                f'or other manipulation-software traces. {highlight} This assessment is '
+                f'based on automated forensic analysis and should be verified by a '
+                f'qualified analyst before being used as evidence.',
+                highlight=highlight,
             )
-        return (
+        return _finish(
             'No significant indicators of synthetic manipulation were detected. '
             'Content appears consistent with authentic, unedited media under '
             'current forensic analysis.'
@@ -709,7 +768,7 @@ def verdict_text_v2(classification: str, dominant_score: float,
             # should not normally occur (editing now classifies as REAL,
             # handled above). Kept so verdict text doesn't silently
             # mismatch the indicator list if this state is ever reached.
-            return (
+            return _finish(
                 f'Forensic analysis detected evidence of editing or post-processing '
                 f'(score {score_str}) - for example colour grading, retouching, cloning, '
                 f'or other manipulation-software traces. This differs from face-swapping '
@@ -720,7 +779,7 @@ def verdict_text_v2(classification: str, dominant_score: float,
                 f'verified by a qualified analyst before being used as evidence.'
             )
         phrase = DEEPFAKE_PHRASING.get(file_type, DEEPFAKE_PHRASING['IMAGE'])
-        return (
+        return _finish(
             f'Multiple indicators associated with deepfake manipulation were detected '
             f'(score {score_str}). Analysis suggests {phrase}. '
             f'This assessment is based on automated forensic analysis and should be '
@@ -728,7 +787,7 @@ def verdict_text_v2(classification: str, dominant_score: float,
         )
     elif classification == 'AI_GENERATED':
         phrase = AI_GEN_PHRASING.get(file_type, AI_GEN_PHRASING['IMAGE'])
-        return (
+        return _finish(
             f'Multiple indicators consistent with AI-generated content were detected '
             f'(score {score_str}). Analysis suggests this content may have been produced by '
             f'{phrase}. '
@@ -736,11 +795,12 @@ def verdict_text_v2(classification: str, dominant_score: float,
             f'verified by a qualified analyst before being used as evidence.'
         )
     else:
-        return (
+        return _finish(
             'Forensic analysis produced insufficient or contradictory evidence to '
             'make a reliable classification. Manual review by a qualified analyst '
             'is recommended.'
         )
+
 
 
 # ── Original helpers — unchanged ──────────────────────────────────────────────
