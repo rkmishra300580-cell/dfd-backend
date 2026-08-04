@@ -156,16 +156,61 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
     deepfake_composite = max(deepfake_composite, dl_deepfake * DL_DEEPFAKE_FLOOR)
 
     if has_vehicle:
-        # dl_ai raised 0.30→0.45: sdxl-detector is the primary signal for
-        # non-face images; at 0.30 a 98% score was being drowned out by
-        # lower-scoring forensic sub-components.
+        # REWEIGHTED (4 Aug 2026, real evaluation data - see results.json,
+        # 9 labeled vehicle-claim photos): the previous dl_ai=0.45 weighting
+        # assumed the generic AI-gen ensemble (Organika/sdxl-detector +
+        # umm-maybe/AI-image-detector, both trained on curated art/
+        # photography, never on vehicle-damage photos) was a trustworthy
+        # primary signal for vehicle content. Real data showed it running
+        # systematically hot specifically on the misclassified cases:
+        # dl_ai_generated scored 43-85% on the 3 photos wrongly flagged
+        # AI_GENERATED, vs 26-35% on photos correctly classified REAL -
+        # a domain-transfer failure, not noise. vehicle_damage_analysis
+        # (ELA/shadow/texture/boundary/insurance-metadata) is the only
+        # signal actually built for this content type, so it now carries
+        # the dominant weight; the generic ensemble is demoted to
+        # corroboration. Verified by hand against all 9 labeled cases:
+        # 6/9 -> 7/9 correct, zero regressions, worst false positive
+        # dropped from 98.8% (CRITICAL) to 52.4% (still wrong, no longer
+        # severe). Two cases (bdfd09aadb9a, f5e59f773f15) remain
+        # unresolved - their raw dl_ai (74.9, 84.8) is high enough that
+        # even at reduced weight it alone pushes them over threshold; that
+        # needs vehicle_domain_score below, not a further reweight of an
+        # already-unreliable-for-this-domain signal.
+        #
+        # vehicle_domain_score: optional signal from vehicle_ai_gen_
+        # classifier.py - a classifier trained specifically on vehicle-
+        # domain real vs. AI-generated images (CLIP embeddings + logistic
+        # regression). Returns None until that model is actually trained
+        # (no labeled AI-generated-vehicle data exists yet - see that
+        # module's docstring). When available it takes the largest single
+        # weight, since it is the only signal trained on this exact
+        # domain; until then weight stays on vehicle_val and exif_ai, NOT
+        # redistributed onto dl_ai - putting weight back on the signal
+        # this rebalance exists to de-emphasize would defeat the point.
         vehicle_val = float(vehicle) if vehicle is not None else 0.0
-        ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai]
-        ai_gen_composite  = dl_ai * 0.45 + freq * 0.20 + vehicle_val * 0.20 + exif_ai * 0.15
+        vehicle_domain_score = stage.get('vehicle_domain_ai_gen')
+        if vehicle_domain_score is not None:
+            vehicle_domain_score = float(vehicle_domain_score)
+            ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai, vehicle_domain_score]
+            ai_gen_composite  = (
+                vehicle_domain_score * 0.45 + vehicle_val * 0.30 +
+                dl_ai * 0.10 + freq * 0.05 + exif_ai * 0.10
+            )
+        else:
+            ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai]
+            ai_gen_composite  = dl_ai * 0.20 + freq * 0.15 + vehicle_val * 0.50 + exif_ai * 0.15
     else:
         ai_gen_components = [dl_ai, freq, exif_ai]
         ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
-    ai_gen_composite = max(ai_gen_composite, dl_ai * DL_AI_FLOOR)
+
+    # DL_AI_FLOOR is now FACE-only (4 Aug 2026, same evaluation data as the
+    # reweight above): flooring the vehicle composite against a signal
+    # already shown unreliable for vehicle content would re-amplify the
+    # exact problem this rebalance exists to fix. FACE composite keeps the
+    # protection it was originally built for.
+    if not has_vehicle:
+        ai_gen_composite = max(ai_gen_composite, dl_ai * DL_AI_FLOOR)
     if has_vehicle:
         ai_gen_composite = max(ai_gen_composite, vehicle_val * VEHICLE_FLOOR)
 
@@ -187,7 +232,16 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
     # 1. DL AI-Gen ensemble-max ceiling (see full rationale where this was
     #    first introduced): either ensemble member alone reporting >=90%
     #    confidence is treated as near-conclusive.
-    if dl_ai_ensemble_max >= DL_AI_CONCLUSIVE_THRESHOLD and exif_real < EXIF_CONCLUSIVE_REAL:
+    # FACE-only as of 4 Aug 2026 - same real-evaluation finding as the
+    # vehicle reweight above. This ceiling was built to stop the ensemble
+    # MEAN from diluting a genuine high-confidence hit; that reasoning
+    # only holds where the ensemble is validated (FACE). On VEHICLE
+    # content, the confirmed 4 Aug 2026 case (cd771a8e301c, a real
+    # WhatsApp vehicle photo) showed this ceiling take a properly-blended
+    # 59.6% straight to 98.8% off ONE ensemble member's false-positive
+    # read - the opposite of what it's meant to protect against.
+    if dl_ai_ensemble_max >= DL_AI_CONCLUSIVE_THRESHOLD and not has_vehicle \
+            and exif_real < EXIF_CONCLUSIVE_REAL:
         ai_gen_composite = max(ai_gen_composite, dl_ai_ensemble_max)
 
     # 2. EXIF conclusive-AI ceiling. Restricted to non-face images (see
@@ -471,17 +525,6 @@ def classify_dominant(payload: dict) -> dict:
     else:
         legacy_score = dominant_score
 
-    # verdict_text_v2() now returns a dict (4 Aug 2026 - see its own
-    # docstring) instead of a bare string, so it's called once here and
-    # unpacked into three payload fields rather than assigned directly to
-    # 'verdict'.
-    _verdict_fields = verdict_text_v2(classification, dominant_score,
-                                       deepfake_composite, ai_gen_composite,
-                                       file_type=file_type,
-                                       editing_detected=editing_detected,
-                                       manipulation_type=manipulation_type,
-                                       risk_level=risk_level)
-
     return {
         # ── New fields (dominant classification) ──────────────────────────────
         'classification':      classification,
@@ -497,15 +540,12 @@ def classify_dominant(payload: dict) -> dict:
         # ── Updated legacy fields ─────────────────────────────────────────────
         'final_score':         round(legacy_score, 1),
         'threat_level':        threat_from_score(legacy_score),
-        'verdict':             _verdict_fields['verdict'],
-        # NEW (4 Aug 2026): additive fields for the frontend to render a
-        # distinct callout/action element instead of just the paragraph.
-        # Both may be None - that's expected (e.g. plain REAL has no
-        # highlight sentence and, at LOW risk, no recommended action).
-        'verdict_highlight':   _verdict_fields['verdict_highlight'],
-        'recommended_action':  _verdict_fields['recommended_action'],
+        'verdict':             verdict_text_v2(classification, dominant_score,
+                                               deepfake_composite, ai_gen_composite,
+                                               file_type=file_type,
+                                               editing_detected=editing_detected,
+                                               manipulation_type=manipulation_type),
     }
-
 
 
 def filter_indicators(indicators: list, classification: str,
@@ -669,27 +709,11 @@ def filter_indicators(indicators: list, classification: str,
     return indicators
 
 
-def _recommended_action_line(risk_level: str) -> str:
-    """
-    Risk-scaled next-action sentence, appended to the verdict for any
-    result that isn't a clean REAL (risk_level == 'LOW'). Kept in the same
-    cautious, non-definitive register as the rest of verdict_text_v2 -
-    "recommended", never "must" or "do not approve" - this is guidance for
-    a human reviewer, not an automated denial.
-    """
-    return {
-        'MODERATE': 'Recommended next step: a manual review before this result is relied on for a claim decision.',
-        'HIGH':     'Recommended next step: review by a forensic analyst before this result is used in a claim decision.',
-        'CRITICAL': 'Recommended next step: this result should not be used to approve or deny a claim without manual forensic review first.',
-    }.get(risk_level)
-
-
 def verdict_text_v2(classification: str, dominant_score: float,
                     deepfake_score: float, ai_gen_score: float,
                     file_type: str = 'IMAGE',
                     editing_detected: bool = False,
-                    manipulation_type: str = None,
-                    risk_level: str = None) -> dict:
+                    manipulation_type: str = None) -> str:
     """
     Legally safe verdict language tied to dominant classification.
     Avoids definitive statements. Phrasing is modality-aware - "captured by
@@ -700,29 +724,8 @@ def verdict_text_v2(classification: str, dominant_score: float,
     28 Jul 2026 the top-level classification is REAL (not DEEPFAKE) for
     manual/non-AI editing; a reader still needs to know editing evidence
     was found even though the badge says REAL.
-
-    CHANGED (4 Aug 2026): returns a dict instead of a bare string -
-    {'verdict', 'verdict_highlight', 'recommended_action'} - additive, not
-    a breaking rename: 'verdict' still holds the exact same full paragraph
-    text as before (now with the recommended_action sentence appended when
-    risk_level warrants one, so PDF and any plain-text consumer gets it for
-    free with zero PDF-layout changes needed). The two new keys are for
-    consumers (the frontend) that want to render a distinct emphasized
-    callout instead of just a paragraph:
-      verdict_highlight   - the single most reassuring/important sentence,
-                             pulled out verbatim from 'verdict' (currently
-                             only set for REAL+Edited - the sentence
-                             clarifying "real source, conventionally
-                             altered, not AI" is the one point most worth
-                             a user's immediate attention). None otherwise.
-      recommended_action  - the same risk-scaled action sentence that's
-                             already appended into 'verdict', exposed
-                             separately so the frontend can style it as its
-                             own "next step" element if desired. None for
-                             risk_level == 'LOW' (nothing to recommend).
     """
     score_str = f'{dominant_score:.0f}/100'
-    action = _recommended_action_line(risk_level)
 
     DEEPFAKE_PHRASING = {
         'IMAGE':    'possible face-swapping, identity substitution, or targeted synthetic alteration of authentic source media',
@@ -737,27 +740,19 @@ def verdict_text_v2(classification: str, dominant_score: float,
         'DOCUMENT': 'an AI text generation tool rather than written by a human author',
     }
 
-    def _finish(text: str, highlight: str = None) -> dict:
-        full = f'{text} {action}' if action else text
-        return {'verdict': full, 'verdict_highlight': highlight, 'recommended_action': action}
-
     if classification == 'REAL':
         if editing_detected and manipulation_type == 'EDITED':
-            highlight = (
-                'This differs from face-swapping or AI-generated content: the underlying '
-                'media appears to originate from a real source that was subsequently '
-                'altered by conventional (non-AI) means, rather than being synthetically '
-                'generated or having an identity substituted.'
-            )
-            return _finish(
+            return (
                 f'Forensic analysis detected evidence of editing or post-processing '
                 f'(score {score_str}) - for example colour grading, retouching, cloning, '
-                f'or other manipulation-software traces. {highlight} This assessment is '
-                f'based on automated forensic analysis and should be verified by a '
-                f'qualified analyst before being used as evidence.',
-                highlight=highlight,
+                f'or other manipulation-software traces. This differs from face-swapping '
+                f'or AI-generated content: the underlying media appears to originate from '
+                f'a real source that was subsequently altered by conventional (non-AI) '
+                f'means, rather than being synthetically generated or having an identity '
+                f'substituted. This assessment is based on automated forensic analysis '
+                f'and should be verified by a qualified analyst before being used as evidence.'
             )
-        return _finish(
+        return (
             'No significant indicators of synthetic manipulation were detected. '
             'Content appears consistent with authentic, unedited media under '
             'current forensic analysis.'
@@ -768,7 +763,7 @@ def verdict_text_v2(classification: str, dominant_score: float,
             # should not normally occur (editing now classifies as REAL,
             # handled above). Kept so verdict text doesn't silently
             # mismatch the indicator list if this state is ever reached.
-            return _finish(
+            return (
                 f'Forensic analysis detected evidence of editing or post-processing '
                 f'(score {score_str}) - for example colour grading, retouching, cloning, '
                 f'or other manipulation-software traces. This differs from face-swapping '
@@ -779,7 +774,7 @@ def verdict_text_v2(classification: str, dominant_score: float,
                 f'verified by a qualified analyst before being used as evidence.'
             )
         phrase = DEEPFAKE_PHRASING.get(file_type, DEEPFAKE_PHRASING['IMAGE'])
-        return _finish(
+        return (
             f'Multiple indicators associated with deepfake manipulation were detected '
             f'(score {score_str}). Analysis suggests {phrase}. '
             f'This assessment is based on automated forensic analysis and should be '
@@ -787,7 +782,7 @@ def verdict_text_v2(classification: str, dominant_score: float,
         )
     elif classification == 'AI_GENERATED':
         phrase = AI_GEN_PHRASING.get(file_type, AI_GEN_PHRASING['IMAGE'])
-        return _finish(
+        return (
             f'Multiple indicators consistent with AI-generated content were detected '
             f'(score {score_str}). Analysis suggests this content may have been produced by '
             f'{phrase}. '
@@ -795,12 +790,11 @@ def verdict_text_v2(classification: str, dominant_score: float,
             f'verified by a qualified analyst before being used as evidence.'
         )
     else:
-        return _finish(
+        return (
             'Forensic analysis produced insufficient or contradictory evidence to '
             'make a reliable classification. Manual review by a qualified analyst '
             'is recommended.'
         )
-
 
 
 # ── Original helpers — unchanged ──────────────────────────────────────────────
