@@ -176,15 +176,20 @@ def _place_graph(c, img_path, x, y, w, h, caption=""):
 STAGE_ORDER = [
     'exif_edit_score', 'frequency', 'face_forensics', 'manipulation',
     'vehicle_damage', 'deep_learning', 'dl_ai_generated',
+    'vehicle_domain_ai_gen',
 ]
 STAGE_LABELS = {
-    'exif_edit_score':  'EXIF Edit Signal',
-    'frequency':        'Frequency Analysis',
-    'face_forensics':   'Face Forensics',
-    'manipulation':     'Manipulation',
-    'vehicle_damage':   'Vehicle Damage',
-    'deep_learning':    'DL Deepfake',
-    'dl_ai_generated':  'DL AI-Generated',
+    'exif_edit_score':        'EXIF Edit Signal',
+    'frequency':               'Frequency Analysis',
+    'face_forensics':          'Face Forensics',
+    'manipulation':            'Manipulation',
+    'vehicle_damage':          'Vehicle Damage',
+    'deep_learning':           'DL Deepfake',
+    'dl_ai_generated':         'DL AI-Generated',
+    # Absent from stage_scores (None) until vehicle_ai_gen_classifier.py
+    # has an actual trained model - _stage_pairs() already skips None
+    # values, so this row simply doesn't appear until then.
+    'vehicle_domain_ai_gen':   'Vehicle-Domain AI-Gen',
 }
 
 def _stage_pairs(stage_scores):
