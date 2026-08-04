@@ -502,6 +502,10 @@ class AnalysisResult:
         stage_scores   = self.payload.get("stage_scores", {})
         classification = self.payload.get("classification", "UNKNOWN")
         real_score     = float(self.payload.get("real_score", 0))
+        # NEW (4 Aug 2026, part of the same display_score fix below): needed
+        # so the header LABEL can also distinguish REAL (Edited) from plain
+        # REAL, not just the number. See _draw_cover/_draw_verdict_page.
+        editing_detected = bool(self.payload.get("editing_detected", False))
         stats          = self.payload.get("stats", [])
 
         # display_score is what actually gets headlined as the big number.
@@ -516,7 +520,26 @@ class AnalysisResult:
         # results, since it's still useful context (matches Stage Score
         # Breakdown / Final Score row), just no longer the misleading
         # headline.
-        display_score = real_score if classification == "REAL" else score
+        #
+        # BUG FIX (4 Aug 2026): the line above only branched on
+        # `classification == "REAL"`, not `editing_detected`. For a
+        # REAL (Edited) result, classify_dominant() sets dominant_score =
+        # edit_composite (editing-evidence strength) and that's exactly
+        # what app/page.js's VerdictHero headlines via result.dominant_score
+        # - but this line still fell back to real_score (~100 - synthetic
+        # signal, unrelated to editing evidence) for every REAL result
+        # regardless of editing_detected. Same payload, two different
+        # headline numbers on screen vs PDF for REAL (Edited) results.
+        # helpers.py's own classify_dominant() docstring already documents
+        # payload['dominant_score'] as "what the frontend shows as the
+        # headline number" - so read that field directly instead of
+        # re-deriving a second, now-stale copy of the same decision here.
+        # Falls back to the old formula only for payloads from before
+        # dominant_score existed.
+        display_score = float(self.payload.get(
+            "dominant_score",
+            real_score if classification == "REAL" else score
+        ))
 
         total_pages = self._estimate_pages()
         buf = io.BytesIO()
@@ -530,7 +553,7 @@ class AnalysisResult:
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
-        self._draw_cover(c, display_score, threat, verdict, stage_scores, file_type, filename, classification, score)
+        self._draw_cover(c, display_score, threat, verdict, stage_scores, file_type, filename, classification, score, editing_detected)
         c.showPage()
         page_num += 1
 
@@ -551,7 +574,7 @@ class AnalysisResult:
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
-        self._draw_verdict_page(c, display_score, threat, stage_scores, verdict, classification, score)
+        self._draw_verdict_page(c, display_score, threat, stage_scores, verdict, classification, score, editing_detected)
         c.showPage()
 
         c.save()
@@ -561,7 +584,7 @@ class AnalysisResult:
 
     # -- Internal PDF builders -------------------------------------------------
 
-    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', raw_score=0.0):
+    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', raw_score=0.0, editing_detected=False):
         v_col = _verdict_color(threat)
         content_top = PAGE_H - MARGIN_T - HEADER_H - 6 * mm
 
@@ -605,13 +628,27 @@ class AnalysisResult:
 
         c.setFont(FONT_R, 7)
         c.setFillColor(C_TEXT_LIGHT)
-        prob_label = "AUTHENTICITY SCORE" if classification == "REAL" else "MANIPULATION PROBABILITY"
+        # LABEL FIX (4 Aug 2026, same root cause as the display_score fix
+        # above): this used to check only `classification == "REAL"`, so a
+        # REAL (Edited) result showed the edit-evidence number under
+        # "AUTHENTICITY SCORE" - e.g. "42.0% AUTHENTICITY SCORE" reads as
+        # low authenticity on a genuinely real photo, when 42.0 is actually
+        # edit_composite (how strong the editing evidence is), not how real
+        # the image is. Now three-way, matching the three cases
+        # classify_dominant() actually produces.
+        if classification == "REAL" and editing_detected:
+            prob_label = "EDIT SIGNAL STRENGTH"
+        elif classification == "REAL":
+            prob_label = "AUTHENTICITY SCORE"
+        else:
+            prob_label = "MANIPULATION PROBABILITY"
         c.drawString(MARGIN_L + 8 * mm, y - card_h + 5 * mm, prob_label)
-        # For REAL results, add a one-line secondary note giving the raw
-        # synthetic-signal strength too (matches the Stage Score Breakdown /
-        # Final Score row below) - context, not correction: the headline
-        # above is now already the authenticity number the label promises.
-        if classification == "REAL":
+        # Secondary note only for plain REAL (not edited): for REAL (Edited),
+        # raw_score (=final_score) now equals the headline number exactly
+        # (both are edit_composite - see the display_score fix above), so
+        # this note would just repeat the headline under a "synthetic
+        # signal" framing that doesn't apply to an edited-but-real image.
+        if classification == "REAL" and not editing_detected:
             c.setFont(FONT_R, 6)
             c.setFillColor(C_TEXT_LIGHT)
             note = f"Synthetic signal strength: {raw_score:.1f}% — see Stage Score Breakdown below"
@@ -756,7 +793,7 @@ class AnalysisResult:
 
         return page_num
 
-    def _draw_verdict_page(self, c, score, threat, stage_scores, verdict, classification='UNKNOWN', raw_score=None):
+    def _draw_verdict_page(self, c, score, threat, stage_scores, verdict, classification='UNKNOWN', raw_score=None, editing_detected=False):
         v_col = _verdict_color(threat)
         content_top = PAGE_H - MARGIN_T - HEADER_H - 10 * mm
 
@@ -779,13 +816,19 @@ class AnalysisResult:
         c.drawCentredString(cx, cy - 5, f"{score:.1f}%")
         c.setFont(FONT_R, 6)
         c.setFillColor(C_TEXT_MID)
-        prob_label = "AUTHENTICITY SCORE" if classification == "REAL" else "MANIPULATION PROBABILITY"
+        # Same three-way label fix as _draw_cover - see the comment there
+        # for the full rationale (4 Aug 2026).
+        if classification == "REAL" and editing_detected:
+            prob_label = "EDIT SIGNAL STRENGTH"
+        elif classification == "REAL":
+            prob_label = "AUTHENTICITY SCORE"
+        else:
+            prob_label = "MANIPULATION PROBABILITY"
         c.drawCentredString(cx, cy - 16, prob_label)
-        # Secondary line for REAL results: the headline above is now the
-        # authenticity number the label promises; this keeps the raw
-        # synthetic-strength number visible too (matches cover page + the
-        # "Final Score" row in the table below), just not as the headline.
-        if classification == "REAL" and raw_score is not None:
+        # Secondary line only for plain REAL (not edited) - see _draw_cover
+        # for why this would be a redundant repeat of the headline for a
+        # REAL (Edited) result.
+        if classification == "REAL" and not editing_detected and raw_score is not None:
             c.setFont(FONT_R, 5)
             c.setFillColor(C_TEXT_LIGHT)
             c.drawCentredString(cx, cy - 22, f"(synthetic signal strength: {raw_score:.1f}%)")
