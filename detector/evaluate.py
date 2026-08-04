@@ -26,22 +26,28 @@ not a pre-verified formality.
 
 --------------------------------------------------------------------------
 Usage (run inside the backend repo, so relative imports resolve):
-    python -m detector.evaluate --images-dir /path/to/images
+    python -m detector.evaluate
+    python -m detector.evaluate --json-out results.json
 
-Each image must be present under --images-dir using its ORIGINAL analysed
-filename. These are copied verbatim from each PDF report's header/footer
-("File analysed: ...") — the literal filenames the pipeline saw in
-production — not reconstructed or guessed:
+By default this needs NO external image storage step: the 9 images are
+embedded (base64) in the sibling module calibration_images.py and get
+written to a temp directory automatically before the pipeline runs. Both
+files must sit together in detector/.
 
-    3607579ddbce_52BC7DB8-4E25-4E13-AE44-F3C4DBAC37D5.PNG
-    5fd820318998_1A27DB72-9905-4B7D-BDA0-A0C8AB20E30D.PNG
-    125a7f07ae17_WhatsApp_Image_2026-07-14_at_21.54.17__1_.jpeg
-    f64fe20b9c3e_WhatsApp_Image_2026-07-14_at_21.50.08.jpeg
-    f3819f373b0c_WhatsApp_Image_2026-07-14_at_21.54.17.jpeg
-    552651bb58c5_WhatsApp_Image_2026-07-14_at_21.54.18.jpeg
-    f5e59f773f15_WhatsApp_Image_2026-07-14_at_21.44.24.jpeg
-    bdfd09aadb9a_WhatsApp_Image_2026-07-14_at_21.47.55.jpeg
-    d79232d43480_WhatsApp_Image_2026-07-14_at_21.53.20.jpeg
+CAVEAT — read this before trusting a surprising number: the embedded
+images arrived via chat upload during the 4 Aug 2026 session, not pulled
+directly from the original WhatsApp/camera source. Content, dimensions,
+and GPS-overlay text were verified against each PDF report, so the
+ground-truth labels are trustworthy — but the exact bytes are not
+guaranteed identical to whatever originally produced the PDF scores (chat
+uploads can re-encode in transit). If a predicted score differs from
+prior_final_score, that could be a real pipeline-logic difference or a
+re-encoding artifact, and this script cannot tell you which. See
+calibration_images.py's own docstring for the same caveat.
+
+--images-dir PATH overrides the embedded images with real files on disk
+(same original-filename convention — see MANIFEST below) if/when you get
+verified originals onto the machine this runs on.
 
 --json-out PATH additionally dumps full per-image results, including the
 complete stage_scores dict for every image, so the specific weighted
@@ -49,13 +55,16 @@ components (dl_ai, freq, vehicle_val, exif_ai, etc.) behind each score can
 be inspected directly rather than re-derived from the headline number.
 """
 import argparse
+import base64
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 from .result import AnalysisResult
 from .image_pipeline import analyze_image
 from .helpers import classify_dominant
+from .calibration_images import CALIBRATION_IMAGES
 
 
 # Ground truth + prior (3 Aug baseline, confirmed against these same 4 Aug
@@ -138,6 +147,18 @@ MANIFEST = [
         "prior_outcome": "miss",
     },
 ]
+
+
+def _materialize_embedded_images(dest_dir: Path) -> None:
+    """
+    Decodes every entry in CALIBRATION_IMAGES to dest_dir, using the same
+    filename keys the MANIFEST below expects. Verified once against the
+    original uploaded bytes (sha256 round-trip check) when this data file
+    was generated — see calibration_images.py's docstring for the caveat
+    about those bytes' relationship to the *original* production files.
+    """
+    for filename, b64_data in CALIBRATION_IMAGES.items():
+        (dest_dir / filename).write_bytes(base64.b64decode(b64_data))
 
 
 def evaluate_one(images_dir: Path, entry: dict) -> dict:
@@ -232,22 +253,38 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="Run the real Darpan pipeline against the 9 labeled evidence images."
     )
-    ap.add_argument("--images-dir", required=True, type=Path,
-                     help="Directory containing the 9 images, named with their original filenames.")
+    ap.add_argument("--images-dir", type=Path, default=None,
+                     help="Optional: directory containing the 9 images (original filenames). "
+                          "If omitted, the embedded copies in calibration_images.py are used instead.")
     ap.add_argument("--json-out", type=Path, default=None,
                      help="Optional path to write full per-image results (including stage_scores) as JSON.")
     args = ap.parse_args()
 
-    if not args.images_dir.is_dir():
-        print(f"ERROR: {args.images_dir} is not a directory", file=sys.stderr)
-        sys.exit(1)
+    tmp_ctx = None
+    if args.images_dir is not None:
+        if not args.images_dir.is_dir():
+            print(f"ERROR: {args.images_dir} is not a directory", file=sys.stderr)
+            sys.exit(1)
+        images_dir = args.images_dir
+        print(f"Using images from --images-dir: {images_dir}")
+    else:
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="darpan_calibration_")
+        images_dir = Path(tmp_ctx.name)
+        _materialize_embedded_images(images_dir)
+        print(f"Using embedded images from calibration_images.py "
+              f"(materialized to {images_dir}) — see this script's module "
+              f"docstring for the caveat on these bytes vs. the originals.")
 
-    results = [evaluate_one(args.images_dir, entry) for entry in MANIFEST]
-    _print_summary(results)
+    try:
+        results = [evaluate_one(images_dir, entry) for entry in MANIFEST]
+        _print_summary(results)
 
-    if args.json_out:
-        args.json_out.write_text(json.dumps(results, indent=2, default=str))
-        print(f"\nFull results (including stage_scores) written to {args.json_out}")
+        if args.json_out:
+            args.json_out.write_text(json.dumps(results, indent=2, default=str))
+            print(f"\nFull results (including stage_scores) written to {args.json_out}")
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
 
 if __name__ == "__main__":
