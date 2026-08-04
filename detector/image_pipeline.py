@@ -33,6 +33,7 @@ from transformers import pipeline as hf_pipeline
 from .result import AnalysisResult
 from .helpers import detect_faces, extract_fake_score, apply_graph_style
 from .router import classify_content_type
+from .vehicle_ai_gen_classifier import score_vehicle_domain
 
 # ============================================================================
 # DELIBERATE EXCEPTION to the "all models are permanent singletons" rule
@@ -1190,6 +1191,27 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
     else:
         R.payload['stage_scores']['dl_ai_ensemble_max'] = None
 
+    # -- Vehicle-domain AI-generation classifier (VEHICLE bucket only) -----
+    # See vehicle_ai_gen_classifier.py docstring: the domain-specific
+    # replacement for relying on the generic sdxl/umm-maybe ensemble for
+    # vehicle content. Returns None until a labeled AI-generated-vehicle
+    # dataset exists and train_and_save() has been run - this is EXPECTED
+    # right now (no such dataset exists yet), not an error.
+    # helpers.py's _compute_image_composites() already treats None as
+    # "signal unavailable" and falls back to the validated vehicle-heavy
+    # weighting that doesn't depend on it.
+    if content_bucket == 'VEHICLE':
+        try:
+            vehicle_domain_score = score_vehicle_domain(pil_image)
+        except Exception as e:
+            vehicle_domain_score = None
+            R.pdf_text(f'Vehicle-domain classifier failed: {e}  -  falling back to existing signals.')
+        if vehicle_domain_score is not None:
+            R.add_stat('Vehicle-Domain AI-Gen Score', f'{vehicle_domain_score:.1f}%')
+            R.payload['stage_scores']['vehicle_domain_ai_gen'] = round(vehicle_domain_score, 1)
+        else:
+            R.add_stat('Vehicle-Domain AI-Gen Score', 'Not yet trained (no labeled AI-generated-vehicle data)')
+
     R.add_stat('DL Deepfake Score', f'{dl_deepfake_score:.1f}%')
     R.add_stat('DL Deepfake Label', matched_label)
     R.payload['stage_scores']['deep_learning'] = round(dl_deepfake_score, 1)
@@ -1764,8 +1786,18 @@ def analyze_image(filepath, R: AnalysisResult):
         CORROBORATION_FREQ_THRESHOLD   = 55.0
         NO_EXIF_CORROBORATED_AI_SCORE  = 70.0  # restores the original strength, but only when earned
 
+        # dl_ai_generated restricted to FACE as a corroboration source
+        # (4 Aug 2026, real evaluation data - see helpers.py's vehicle
+        # reweight comment for the full case). dl_ai is already weighted
+        # directly in ai_gen_composite; letting it also drive exif_ai to
+        # 70 double-counts the same signal through a second channel, and
+        # for VEHICLE content that signal was shown to run hot on real
+        # photos specifically. freq_score and the noise-contradiction path
+        # are independent pixel-level signals and stay valid for all
+        # content types.
         corroborated = (
-            (dl_ai_for_corroboration is not None and dl_ai_for_corroboration >= CORROBORATION_DL_AI_THRESHOLD)
+            (content_bucket == 'FACE' and dl_ai_for_corroboration is not None
+             and dl_ai_for_corroboration >= CORROBORATION_DL_AI_THRESHOLD)
             or freq_score >= CORROBORATION_FREQ_THRESHOLD
             or exif_result['exif_ai_score'] >= 55.0  # the noise-contradiction block already fired
         )
