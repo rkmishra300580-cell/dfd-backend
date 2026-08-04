@@ -18,6 +18,28 @@ STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
+
+def stripe_get(obj, key, default=None):
+    """
+    Safe accessor for Stripe SDK objects (StripeObject and subclasses).
+
+    Confirmed via live traceback (billing.py:99, 3 Aug 2026) that these
+    objects do NOT implement .get() the way a dict does -- unknown
+    attribute access (including "get") is routed through __getattr__
+    and raises AttributeError instead of returning a bound method:
+
+        AttributeError: get
+
+    Bracket access (obj[key]) IS confirmed working elsewhere in this file
+    (session["metadata"]["internal_user_id"], subscription["id"]), but
+    raises KeyError when the key is absent. This wraps that in a
+    dict.get()-equivalent so optional fields don't crash the webhook.
+    """
+    try:
+        return obj[key]
+    except (KeyError, TypeError):
+        return default
+
 PLAN_CONFIG = {
     "monthly": {"price_id": os.environ.get("STRIPE_PRICE_MONTHLY", "price_REPLACE_ME"), "quota": 500},
     "enterprise": {"price_id": os.environ.get("STRIPE_PRICE_ENTERPRISE", "price_REPLACE_ME"), "quota": 999999},
@@ -96,7 +118,7 @@ async def stripe_webhook(request: Request):
                     current_period_start = now(), updated_at = now()
                 WHERE user_id = $5
                 """,
-                plan, quota, session.get("customer"), session.get("subscription"), user_id,
+                plan, quota, stripe_get(session, "customer"), stripe_get(session, "subscription"), user_id,
             )
 
     elif event["type"] == "customer.subscription.deleted":
@@ -111,7 +133,7 @@ async def stripe_webhook(request: Request):
             )
 
     elif event["type"] == "invoice.payment_failed":
-        subscription_id = event["data"]["object"].get("subscription")
+        subscription_id = stripe_get(event["data"]["object"], "subscription")
         if subscription_id:
             async with pool.acquire() as conn:
                 await conn.execute(
