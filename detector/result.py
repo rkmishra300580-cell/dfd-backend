@@ -293,7 +293,20 @@ class AnalysisResult:
     def __init__(self, job_id: str):
         self.job_id       = job_id
         self.payload      = {
-            "job_id": job_id, "graphs": [], "indicators": [], "stats": [], "stage_scores": {},
+            # exif_ai_corroborated defaults to explicit False rather than being
+            # absent-by-default. Previously it was only ever added to
+            # stage_scores when the no-EXIF corroboration block in
+            # image_pipeline.py set it True (the block right after
+            # dl_detector() in analyze_image()) - it was never written as
+            # False anywhere, so "absent" and "False" were indistinguishable
+            # in the payload/report JSON. That ambiguity is what made a
+            # 4 Aug 2026 anomaly (exif_ai_score=70.0 with the key missing
+            # entirely) impossible to read conclusively from the JSON alone.
+            # This fix does NOT explain that anomaly - it only ensures it
+            # can't happen again: the key is now always present, so its
+            # exact value (not its presence) is the signal going forward.
+            "job_id": job_id, "graphs": [], "indicators": [], "stats": [],
+            "stage_scores": {"exif_ai_corroborated": False},
             # New REAL / AI_GENERATED / DEEPFAKE taxonomy fields (additive, Phase 1).
             "classification":        "UNKNOWN",
             "real_score":            0.0,
