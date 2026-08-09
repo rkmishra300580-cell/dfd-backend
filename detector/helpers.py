@@ -525,6 +525,13 @@ def classify_dominant(payload: dict) -> dict:
     else:
         legacy_score = dominant_score
 
+    _verdict_fields = verdict_text_v2(classification, dominant_score,
+                                       deepfake_composite, ai_gen_composite,
+                                       file_type=file_type,
+                                       editing_detected=editing_detected,
+                                       manipulation_type=manipulation_type,
+                                       risk_level=risk_level)
+
     return {
         # ── New fields (dominant classification) ──────────────────────────────
         'classification':      classification,
@@ -540,11 +547,12 @@ def classify_dominant(payload: dict) -> dict:
         # ── Updated legacy fields ─────────────────────────────────────────────
         'final_score':         round(legacy_score, 1),
         'threat_level':        threat_from_score(legacy_score),
-        'verdict':             verdict_text_v2(classification, dominant_score,
-                                               deepfake_composite, ai_gen_composite,
-                                               file_type=file_type,
-                                               editing_detected=editing_detected,
-                                               manipulation_type=manipulation_type),
+        'verdict':             _verdict_fields['verdict'],
+        # RESTORED 9 Aug 2026 - see verdict_text_v2/_recommended_action_line
+        # docstrings. page.js already has UI built for both of these; they
+        # were simply never being sent.
+        'verdict_highlight':   _verdict_fields['verdict_highlight'],
+        'recommended_action':  _verdict_fields['recommended_action'],
     }
 
 
@@ -709,11 +717,40 @@ def filter_indicators(indicators: list, classification: str,
     return indicators
 
 
+def _recommended_action_line(risk_level: str):
+    """
+    Risk-scaled recommended-action text for a human reviewer. Cautious
+    register matching verdict_text_v2's legal-safety tone - guidance, never
+    a command ("must"/"do not approve" are avoided deliberately).
+
+    RESTORED 9 Aug 2026: page.js already contains built, styled UI for
+    result.recommended_action (its own bordered callout with an icon - see
+    VerdictHero around the "Recommended next step" block) and for
+    result.verdict_highlight. Neither field was actually being produced by
+    this backend, so that UI has been silently dead on every deployed
+    result - confirmed by grepping this file and result.py and finding zero
+    occurrences of either field name before this change. Not new scope:
+    reconnecting a contract the frontend was already built against.
+
+    Returns None for LOW/MINIMAL/unset risk - nothing to recommend beyond
+    the verdict itself on a low-risk result.
+    """
+    r = (risk_level or '').upper()
+    if r == 'MODERATE':
+        return 'Recommended next step: a manual review before this result is relied on for a claim decision.'
+    if r == 'HIGH':
+        return 'Recommended next step: review by a forensic analyst before this result is used in a claim decision.'
+    if r == 'CRITICAL':
+        return 'Recommended next step: this result should not be used to approve or deny a claim without manual forensic review first.'
+    return None
+
+
 def verdict_text_v2(classification: str, dominant_score: float,
                     deepfake_score: float, ai_gen_score: float,
                     file_type: str = 'IMAGE',
                     editing_detected: bool = False,
-                    manipulation_type: str = None) -> str:
+                    manipulation_type: str = None,
+                    risk_level: str = None) -> dict:
     """
     Legally safe verdict language tied to dominant classification.
     Avoids definitive statements. Phrasing is modality-aware - "captured by
@@ -724,8 +761,21 @@ def verdict_text_v2(classification: str, dominant_score: float,
     28 Jul 2026 the top-level classification is REAL (not DEEPFAKE) for
     manual/non-AI editing; a reader still needs to know editing evidence
     was found even though the badge says REAL.
+
+    Returns a dict: {'verdict', 'verdict_highlight', 'recommended_action'}.
+    - verdict: the full paragraph (unchanged text from the previous
+      string-returning version - verified byte-identical when no action
+      line applies).
+    - verdict_highlight: the single most reassuring/important sentence,
+      pulled out so the frontend/PDF can give it distinct visual weight.
+      Currently only set for the REAL+EDITED case. None otherwise.
+    - recommended_action: from _recommended_action_line(risk_level) above.
+      Also appended into the full 'verdict' string (not just returned
+      separately), so PDF/plain-text consumers that only read 'verdict'
+      still get it automatically with no separate layout work needed.
     """
     score_str = f'{dominant_score:.0f}/100'
+    action = _recommended_action_line(risk_level)
 
     DEEPFAKE_PHRASING = {
         'IMAGE':    'possible face-swapping, identity substitution, or targeted synthetic alteration of authentic source media',
@@ -740,30 +790,37 @@ def verdict_text_v2(classification: str, dominant_score: float,
         'DOCUMENT': 'an AI text generation tool rather than written by a human author',
     }
 
+    highlight = None
+
     if classification == 'REAL':
         if editing_detected and manipulation_type == 'EDITED':
-            return (
+            highlight = (
+                'This differs from face-swapping or AI-generated content: the '
+                'underlying media appears to originate from a real source that '
+                'was subsequently altered by conventional (non-AI) means, '
+                'rather than being synthetically generated or having an '
+                'identity substituted.'
+            )
+            verdict = (
                 f'Forensic analysis detected evidence of editing or post-processing '
                 f'(score {score_str}) - for example colour grading, retouching, cloning, '
-                f'or other manipulation-software traces. This differs from face-swapping '
-                f'or AI-generated content: the underlying media appears to originate from '
-                f'a real source that was subsequently altered by conventional (non-AI) '
-                f'means, rather than being synthetically generated or having an identity '
-                f'substituted. This assessment is based on automated forensic analysis '
+                f'or other manipulation-software traces. {highlight} '
+                f'This assessment is based on automated forensic analysis '
                 f'and should be verified by a qualified analyst before being used as evidence.'
             )
-        return (
-            'No significant indicators of synthetic manipulation were detected. '
-            'Content appears consistent with authentic, unedited media under '
-            'current forensic analysis.'
-        )
+        else:
+            verdict = (
+                'No significant indicators of synthetic manipulation were detected. '
+                'Content appears consistent with authentic, unedited media under '
+                'current forensic analysis.'
+            )
     elif classification == 'DEEPFAKE':
         if manipulation_type == 'EDITED':
             # Defensive fallback only - as of 28 Jul 2026 this combination
             # should not normally occur (editing now classifies as REAL,
             # handled above). Kept so verdict text doesn't silently
             # mismatch the indicator list if this state is ever reached.
-            return (
+            verdict = (
                 f'Forensic analysis detected evidence of editing or post-processing '
                 f'(score {score_str}) - for example colour grading, retouching, cloning, '
                 f'or other manipulation-software traces. This differs from face-swapping '
@@ -773,16 +830,17 @@ def verdict_text_v2(classification: str, dominant_score: float,
                 f'assessment is based on automated forensic analysis and should be '
                 f'verified by a qualified analyst before being used as evidence.'
             )
-        phrase = DEEPFAKE_PHRASING.get(file_type, DEEPFAKE_PHRASING['IMAGE'])
-        return (
-            f'Multiple indicators associated with deepfake manipulation were detected '
-            f'(score {score_str}). Analysis suggests {phrase}. '
-            f'This assessment is based on automated forensic analysis and should be '
-            f'verified by a qualified analyst before being used as evidence.'
-        )
+        else:
+            phrase = DEEPFAKE_PHRASING.get(file_type, DEEPFAKE_PHRASING['IMAGE'])
+            verdict = (
+                f'Multiple indicators associated with deepfake manipulation were detected '
+                f'(score {score_str}). Analysis suggests {phrase}. '
+                f'This assessment is based on automated forensic analysis and should be '
+                f'verified by a qualified analyst before being used as evidence.'
+            )
     elif classification == 'AI_GENERATED':
         phrase = AI_GEN_PHRASING.get(file_type, AI_GEN_PHRASING['IMAGE'])
-        return (
+        verdict = (
             f'Multiple indicators consistent with AI-generated content were detected '
             f'(score {score_str}). Analysis suggests this content may have been produced by '
             f'{phrase}. '
@@ -790,11 +848,16 @@ def verdict_text_v2(classification: str, dominant_score: float,
             f'verified by a qualified analyst before being used as evidence.'
         )
     else:
-        return (
+        verdict = (
             'Forensic analysis produced insufficient or contradictory evidence to '
             'make a reliable classification. Manual review by a qualified analyst '
             'is recommended.'
         )
+
+    if action:
+        verdict = f'{verdict} {action}'
+
+    return {'verdict': verdict, 'verdict_highlight': highlight, 'recommended_action': action}
 
 
 # ── Original helpers — unchanged ──────────────────────────────────────────────
