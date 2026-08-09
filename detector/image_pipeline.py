@@ -356,6 +356,23 @@ def face_forensic_analysis(filepath, pil_image, freq_score, freq_indicators, R: 
     R.add_stat('Human Faces Detected', len(faces))
     R.add_stat('Raw Detections',       len(raw_faces))
 
+    if not has_human_face:
+        # No human face  -  face forensics not applicable. FIX (9 Aug 2026):
+        # previously the Face Detection graph below was still generated and
+        # saved unconditionally even here, so every non-face image (e.g. a
+        # vehicle-damage photo) still produced a full "Stage 2 - Face
+        # Forensic Analysis" PDF page showing only "0 human face(s)
+        # detected" - a wasted page with zero actual analysis on it. The
+        # forensics graph further down was already correctly skipped in
+        # this branch; this makes the two consistent by skipping the
+        # detection graph too, so _group_graphs() never creates that
+        # section at all for non-face content.
+        # Return freq_score as the combined score; vehicle stage will handle the rest
+        R.add_stat('Face Forensic Score', 'N/A  -  no human face detected')
+        R.payload['stage_scores']['face_forensics'] = None
+        R.pdf_text('No human faces detected. Skipping face forensics. Vehicle damage analysis will run instead.')
+        return freq_score, face_indicators, has_human_face
+
     fig, ax = plt.subplots(figsize=(8, 8))
     visual  = rgb_image.copy()
     for (fx, fy, fw, fh) in faces:
@@ -371,14 +388,6 @@ def face_forensic_analysis(filepath, pil_image, freq_score, freq_indicators, R: 
     R.save_graph('detected_faces.png', 'Face Detection',
                  f'{len(faces)} human face(s) confirmed. Grey boxes = filtered false positives (licence plates, objects).', important=True)
     plt.close(fig)
-
-    if not has_human_face:
-        # No human face  -  face forensics not applicable
-        # Return freq_score as the combined score; vehicle stage will handle the rest
-        R.add_stat('Face Forensic Score', 'N/A  -  no human face detected')
-        R.payload['stage_scores']['face_forensics'] = None
-        R.pdf_text('No human faces detected. Skipping face forensics. Vehicle damage analysis will run instead.')
-        return freq_score, face_indicators, has_human_face
 
     # Run face forensics on largest face
     fx, fy, fw, fh = max(faces, key=lambda f: f[2]*f[3])
@@ -1172,6 +1181,16 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
     dl_ai_score       = None
     ai_matched_label = 'none'
     _ai_scores = []
+    # NEW (9 Aug 2026): explicit per-model scores, not just the pooled list.
+    # Previously the only place both raw ensemble members existed together
+    # was a formatted display string ('DL AI-Gen Ensemble Scores', 'X / Y')
+    # meant for the PDF table - there was no numeric field a frontend could
+    # read to show model disagreement as its own signal (e.g. one model at
+    # 6%, the other at 92%, averaged into an unremarkable-looking 49%).
+    # None if that specific model failed to load/run - a frontend consuming
+    # this must treat None as "unavailable", not 0.
+    dl_ai_gen_model_1 = None  # sdxl-detector
+    dl_ai_gen_model_2 = None  # umm-maybe/AI-image-detector
 
     # Model 1: sdxl-detector
     try:
@@ -1179,6 +1198,7 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
         ai_label_map_1 = {r['label']: r['score'] for r in ai_result_1}
         score_1, label_1 = _extract_ai_generated_score(ai_label_map_1)
         _ai_scores.append(score_1)
+        dl_ai_gen_model_1 = round(float(score_1), 1)
         ai_matched_label = label_1
         R.pdf_text(f'AI-gen model 1 (sdxl-detector): {ai_result_1}')
     except Exception as e:
@@ -1190,10 +1210,14 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
         ai_label_map_2 = {r['label']: r['score'] for r in ai_result_2}
         score_2, label_2 = _extract_ai_generated_score(ai_label_map_2)
         _ai_scores.append(score_2)
+        dl_ai_gen_model_2 = round(float(score_2), 1)
         R.pdf_text(f'AI-gen model 2 (umm-maybe/AI-image-detector): {ai_result_2}')
         R.add_stat('DL AI-Gen Model 2 Score', f'{score_2:.1f}%')
     except Exception as e:
         R.pdf_text(f'AI-gen model 2 (umm-maybe) failed: {e}')
+
+    R.payload['stage_scores']['dl_ai_gen_model_1'] = dl_ai_gen_model_1
+    R.payload['stage_scores']['dl_ai_gen_model_2'] = dl_ai_gen_model_2
 
     if _ai_scores:
         # Average ensemble scores — equal weight, both models validated on same label scheme
