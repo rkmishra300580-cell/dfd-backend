@@ -765,7 +765,31 @@ def manipulation_analysis(filepath, pil_image, R: AnalysisResult):
         component_scores['patch'] = 0.0
 
     # -- Combine --------------------------------------------------
-    weights     = {'ela': 0.35, 'copy_move': 0.25, 'prnu': 0.20, 'patch': 0.12, 'metadata': 0.08}
+    # REWEIGHTED (9 Aug 2026, real evaluation data - 7 labeled images,
+    # real photos edited by conversational AI tools e.g. ChatGPT/Claude,
+    # ground truth NOT REAL). Two of three misses showed patch-level
+    # inconsistency firing strongly (44%, 70%) while ela and copy_move
+    # both returned exactly 0 on both - yet ela+copy_move carried 60% of
+    # the total weight and patch only 12%. Confirmed by hand-reproducing
+    # the exact combine formula against both cases' component_scores -
+    # matched the reported Manipulation Score to one decimal place both
+    # times, so this is measured, not inferred.
+    #
+    # HONEST LIMIT, verified by actually re-running classify_dominant()
+    # with these new weights against all 3 miss cases: this reweight does
+    # NOT flip any of them to the correct classification. deepfake_
+    # composite's own floor (dl_deepfake * DL_DEEPFAKE_FLOOR, see
+    # helpers.py) sits above what even a fully-boosted patch score
+    # contributes here, so the improvement is real but currently
+    # invisible at the final-score level for these specific cases. Ships
+    # anyway because it's a correct, evidence-backed improvement on its
+    # own terms (trusting the sub-signal that actually fired more than
+    # ones that returned zero) - but closing the gap on this class of
+    # localized-AI-edit content needs a look at deepfake_composite's
+    # floor/weights themselves, with more labeled data (including
+    # confirmed-REAL counter-examples this project does not yet have),
+    # not another manip-only reweight.
+    weights     = {'ela': 0.25, 'copy_move': 0.20, 'prnu': 0.20, 'patch': 0.25, 'metadata': 0.10}
     manip_score = float(np.clip(
         sum(component_scores.get(k, 0) * w for k, w in weights.items()), 0, 100
     ))
