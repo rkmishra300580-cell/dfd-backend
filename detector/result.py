@@ -62,6 +62,26 @@ def _verdict_color(threat: str):
     return C_TEXT_MID
 
 
+def _confidence_category(classification: str, threat: str, editing_detected: bool = False) -> str:
+    """
+    Plain-language category label to sit above the raw threat word on the
+    PDF cover, mirroring the same borderline/confident distinction added to
+    page.js's VerdictHero (9 Aug 2026) - a MODERATE-risk AI_GENERATED result
+    previously looked structurally identical to a CRITICAL one on paper,
+    same layout, same font sizes, only the word and color differed. This
+    doesn't replace the threat word or its color-coding (both stay exactly
+    as before); it adds one short line of context above it.
+    """
+    t = (threat or '').upper()
+    if classification == 'REAL':
+        return 'Likely real, edited' if editing_detected else 'Likely real'
+    if classification in ('AI_GENERATED', 'DEEPFAKE'):
+        if t in ('HIGH', 'CRITICAL'):
+            return 'Strong AI-generation signal' if classification == 'AI_GENERATED' else 'Strong deepfake signal'
+        return 'Needs review — signal is weak'
+    return 'Inconclusive'
+
+
 def _draw_watermark(c):
     c.saveState()
     c.setFillColor(Color(0.88, 0.91, 0.95, alpha=0.15))
@@ -546,12 +566,58 @@ class AnalysisResult:
             real_score if classification == "REAL" else score
         ))
 
-        total_pages = self._estimate_pages()
+        # FIX (9 Aug 2026): total_pages was previously a static upfront
+        # estimate (_estimate_pages(), still below for reference/removal
+        # candidate) that never accounted for the detailed-metrics pages
+        # _draw_detailed_metrics() adds - confirmed by reproducing the
+        # "Page 7 of 6" / "8 of 6" / "9 of 6" bug directly: page_num kept
+        # incrementing correctly as pages were actually drawn, but the "of
+        # N" denominator baked into every header was fixed from the start
+        # and never caught up. Root-cause fix, not a better estimate: run
+        # the exact same page-generation logic once against a throwaway
+        # canvas purely to find the true final page_num, then run it again
+        # for the real output using that as the correct total. Doubles PDF
+        # generation time but that's a non-issue next to model inference
+        # time elsewhere in this pipeline, and it's the only way to get an
+        # accurate denominator for content whose page count depends on
+        # how many stats/graphs a given image actually produced.
+        dry_buf = io.BytesIO()
+        dry_c   = canvas.Canvas(dry_buf, pagesize=A4)
+        true_total_pages = self._render_pages(
+            dry_c, total_pages=1, filename=filename, file_type=file_type,
+            display_score=display_score, threat=threat, verdict=verdict,
+            stage_scores=stage_scores, classification=classification,
+            score=score, editing_detected=editing_detected, stats=stats,
+        )
+
         buf = io.BytesIO()
         c = canvas.Canvas(buf, pagesize=A4)
         c.setTitle(f"Darpan Forensic Report  -  {self.job_id}")
         c.setAuthor("AlgorivX.AI . Darpan Forensic Engine v5")
+        self._render_pages(
+            c, total_pages=true_total_pages, filename=filename, file_type=file_type,
+            display_score=display_score, threat=threat, verdict=verdict,
+            stage_scores=stage_scores, classification=classification,
+            score=score, editing_detected=editing_detected, stats=stats,
+        )
 
+        c.save()
+        os.makedirs(os.path.dirname(self.report_path), exist_ok=True)
+        with open(self.report_path, "wb") as f:
+            f.write(buf.getvalue())
+
+    def _render_pages(self, c, total_pages, filename, file_type, display_score,
+                       threat, verdict, stage_scores, classification, score,
+                       editing_detected, stats):
+        """
+        Draws every page of the report onto canvas c, using total_pages as
+        the header denominator throughout. Returns the true final page_num
+        reached - used by build_pdf() as the dry-run pass to discover the
+        correct total_pages for the real pass. Pulled out of build_pdf()
+        specifically so both passes run the exact same logic - a second,
+        separately-maintained "count pages" function would drift from the
+        real drawing code the moment either one changed.
+        """
         page_num = 1
 
         # -- PAGE 1: Cover + Summary -------------------------------------------
@@ -582,10 +648,7 @@ class AnalysisResult:
         self._draw_verdict_page(c, display_score, threat, stage_scores, verdict, classification, score, editing_detected)
         c.showPage()
 
-        c.save()
-        os.makedirs(os.path.dirname(self.report_path), exist_ok=True)
-        with open(self.report_path, "wb") as f:
-            f.write(buf.getvalue())
+        return page_num
 
     # -- Internal PDF builders -------------------------------------------------
 
@@ -664,9 +727,13 @@ class AnalysisResult:
         c.setLineWidth(0.5)
         c.line(div_x, y - card_h + 4 * mm, div_x, y - 4 * mm)
 
+        c.setFont(FONT_R, 7.5)
+        c.setFillColor(C_TEXT_LIGHT)
+        c.drawString(div_x + 6 * mm, y - 9 * mm, _confidence_category(classification, threat, editing_detected).upper())
+
         c.setFont(FONT_B, 18)
         c.setFillColor(v_col)
-        c.drawString(div_x + 6 * mm, y - 17 * mm, threat.upper())
+        c.drawString(div_x + 6 * mm, y - 20 * mm, threat.upper())
 
         bar_y = y - card_h + 3 * mm
         bar_x = MARGIN_L + 8 * mm
