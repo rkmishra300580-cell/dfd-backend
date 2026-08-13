@@ -132,6 +132,26 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
     exif_edit    = float(stage.get('exif_edit_score',  0) or 0)
     exif_real    = float(stage.get('exif_real_score',  0) or 0)
 
+    # BUG FIX (13 Aug 2026): exif_ai_base is what the BASE weighted formulas
+    # below use. When exif_ai_corroborated is True, exif_ai's value was
+    # boosted by borrowing strength from dl_ai_generated/frequency (see
+    # image_pipeline.py's no-EXIF-corroboration block) - and dl_ai/freq are
+    # ALREADY weighted directly in these same formulas. Using the boosted
+    # exif_ai there double-counts them a second time through the EXIF
+    # channel. The EXIF-conclusive ceiling further below already guards
+    # against this for itself (`not exif_ai_corroborated`); this extends the
+    # same protection to the base formula, which previously had no gate at
+    # all. exif_ai_score_intrinsic is the pre-boost value (genuine, weaker,
+    # standalone EXIF evidence - e.g. the reduced "no metadata, ambiguous"
+    # base score, or any independent noise-contradiction boost) preserved by
+    # image_pipeline.py specifically for this. Falls back to exif_ai itself
+    # if a payload predates this field or isn't corroborated.
+    exif_ai_base = (
+        float(stage['exif_ai_score_intrinsic'])
+        if exif_ai_corroborated and stage.get('exif_ai_score_intrinsic') is not None
+        else exif_ai
+    )
+
     if has_vehicle is None:
         has_vehicle = vehicle is not None   # fallback only - legacy/non-routed callers
 
@@ -192,17 +212,17 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
         vehicle_domain_score = stage.get('vehicle_domain_ai_gen')
         if vehicle_domain_score is not None:
             vehicle_domain_score = float(vehicle_domain_score)
-            ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai, vehicle_domain_score]
+            ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai_base, vehicle_domain_score]
             ai_gen_composite  = (
                 vehicle_domain_score * 0.45 + vehicle_val * 0.30 +
-                dl_ai * 0.10 + freq * 0.05 + exif_ai * 0.10
+                dl_ai * 0.10 + freq * 0.05 + exif_ai_base * 0.10
             )
         else:
-            ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai]
-            ai_gen_composite  = dl_ai * 0.20 + freq * 0.15 + vehicle_val * 0.50 + exif_ai * 0.15
+            ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai_base]
+            ai_gen_composite  = dl_ai * 0.20 + freq * 0.15 + vehicle_val * 0.50 + exif_ai_base * 0.15
     else:
-        ai_gen_components = [dl_ai, freq, exif_ai]
-        ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai * 0.30
+        ai_gen_components = [dl_ai, freq, exif_ai_base]
+        ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai_base * 0.30
 
     # DL_AI_FLOOR is now FACE-only (4 Aug 2026, same evaluation data as the
     # reweight above): flooring the vehicle composite against a signal
