@@ -1851,6 +1851,27 @@ def analyze_image(filepath, R: AnalysisResult):
         )
 
         if corroborated:
+            # BUG FIX (13 Aug 2026): snapshot the pre-boost value BEFORE
+            # overwriting exif_ai_score below. helpers.py's classify_dominant()
+            # base weighted formula (ai_gen_composite = dl_ai*w1 + freq*w2 +
+            # exif_ai*w3) has no gate on exif_ai_corroborated - only the
+            # separate EXIF-conclusive CEILING does. When this block boosts
+            # exif_ai_score to 70 by borrowing strength from dl_ai/freq (the
+            # very signals already weighted directly in that same formula),
+            # the base formula silently double-counts them a second time
+            # through the inflated exif_ai term. Confirmed via real code
+            # execution (13 Aug 2026, eaf89e15e8cd reproduction): with the
+            # double-count, ai_gen_composite=49.87 (NEEDS REVIEW); using this
+            # intrinsic pre-boost value instead, it correctly recomputes to
+            # 36.37 (REAL) - matching the hand-traced root-cause analysis.
+            # 'exif_ai_score_intrinsic' preserves the genuine-but-weak
+            # standalone EXIF evidence (e.g. the reduced +25 "no metadata,
+            # ambiguous" base score, or any legitimate boost already applied
+            # by the earlier noise-contradiction block at line ~1722, which
+            # IS independent evidence and is correctly included here) so
+            # helpers.py can use it instead of the boosted value when
+            # exif_ai_corroborated is True.
+            R.payload['stage_scores']['exif_ai_score_intrinsic'] = round(exif_result['exif_ai_score'], 1)
             exif_result['exif_ai_score'] = max(exif_result['exif_ai_score'], NO_EXIF_CORROBORATED_AI_SCORE)
             R.payload['stage_scores']['exif_ai_score'] = round(exif_result['exif_ai_score'], 1)
             # Flag this score as corroboration-derived, not intrinsic EXIF evidence.
