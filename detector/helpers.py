@@ -155,6 +155,42 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
     if has_vehicle is None:
         has_vehicle = vehicle is not None   # fallback only - legacy/non-routed callers
 
+    # CANDIDATE FIX (13 Aug 2026) - INERT BY DEFAULT, NOT YET VALIDATED.
+    # DO NOT raise ENSEMBLE_SOFTMAX_ALPHA above 0.0 until tested against
+    # real-negative (genuine, unedited photo) data, not just positive cases.
+    #
+    # Confirmed via 5 real production reports (a3c8e0d26e56, b4bdd97c7671,
+    # 68d50b30b32c, 3bd5e4b313f7, ed8f93052f47, all AI-edited real photos)
+    # that plain mean-averaging of the two dl_ai_generated ensemble members
+    # silently discards genuine signal whenever the higher member doesn't
+    # independently clear DL_AI_CONCLUSIVE_THRESHOLD below - both misses in
+    # that batch (mean 38.4, 59.4) had a materially higher member (52.8,
+    # 65.2) diluted below where anything downstream could act on it.
+    #
+    # This blends dl_ai toward whichever ensemble member is higher, WITHOUT
+    # fully trusting max() alone. Full max() is the exact strategy already
+    # confirmed to backfire on real photos elsewhere in this function - see
+    # the has_vehicle block below (cd771a8e301c, a real vehicle photo pushed
+    # from a properly-blended 59.6% to 98.8% off one model's false read) -
+    # so a soft blend is used instead of repeating that mistake here.
+    #
+    # DELIBERATELY SCOPED to non-vehicle content only, matching the existing,
+    # already-validated precedent that the generic ensemble is untrustworthy
+    # for vehicle-domain photos (see "REWEIGHTED 4 Aug 2026" comment below).
+    # Do not remove the `not has_vehicle` gate without separate vehicle-
+    # domain evaluation data.
+    #
+    # alpha=0.0 reproduces the exact currently-shipped mean behavior (this
+    # block is a no-op at the default). 0.6 was the best-looking value
+    # against the 5 known-positive cases only - it has NEVER been checked
+    # against a single genuine real photo and must be re-tuned once
+    # real-negative data exists, per the project's real-evaluation-before-
+    # shipping standard.
+    ENSEMBLE_SOFTMAX_ALPHA = 0.0
+    if not has_vehicle and dl_ai_ensemble_max > dl_ai and ENSEMBLE_SOFTMAX_ALPHA > 0:
+        dl_ai = (ENSEMBLE_SOFTMAX_ALPHA * dl_ai_ensemble_max
+                  + (1 - ENSEMBLE_SOFTMAX_ALPHA) * dl_ai)
+
     EXIF_CONCLUSIVE_AI   = 70.0
     EXIF_CONCLUSIVE_REAL = 65.0
 
@@ -221,15 +257,48 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
             ai_gen_components = [dl_ai, freq, vehicle_val, exif_ai_base]
             ai_gen_composite  = dl_ai * 0.20 + freq * 0.15 + vehicle_val * 0.50 + exif_ai_base * 0.15
     else:
-        ai_gen_components = [dl_ai, freq, exif_ai_base]
-        ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai_base * 0.30
+        # photo_edit_domain_score: optional signal from photo_edit_
+        # classifier.py (14 Aug 2026) - a classifier trained specifically
+        # on real-photo-vs-AI-edited-real-photo (CLIP embeddings + logistic
+        # regression), the exact task confirmed neither generic ensemble
+        # member was validated for. Returns None until that model is
+        # actually trained (no labeled data exists yet - see that module's
+        # docstring). Same pattern as vehicle_domain_score above: when
+        # available it takes the largest single weight, since it is the
+        # only signal trained on this exact domain; until then weight
+        # stays on dl_ai/freq/exif_ai_base exactly as before - NOT a
+        # silent behavior change for any payload that predates this field.
+        photo_edit_domain_score = stage.get('photo_edit_domain')
+        if photo_edit_domain_score is not None:
+            photo_edit_domain_score = float(photo_edit_domain_score)
+            ai_gen_components = [dl_ai, freq, exif_ai_base, photo_edit_domain_score]
+            ai_gen_composite  = (
+                photo_edit_domain_score * 0.50 + dl_ai * 0.20 +
+                freq * 0.10 + exif_ai_base * 0.20
+            )
+        else:
+            ai_gen_components = [dl_ai, freq, exif_ai_base]
+            ai_gen_composite  = dl_ai * 0.40 + freq * 0.30 + exif_ai_base * 0.30
 
-    # DL_AI_FLOOR is now FACE-only (4 Aug 2026, same evaluation data as the
-    # reweight above): flooring the vehicle composite against a signal
-    # already shown unreliable for vehicle content would re-amplify the
-    # exact problem this rebalance exists to fix. FACE composite keeps the
-    # protection it was originally built for.
-    if not has_vehicle:
+    # DL_AI_FLOOR is FACE-only (4 Aug 2026, same evaluation data as the
+    # reweight above; tightened 15 Aug 2026 - see note below).
+    # Flooring the composite against a signal already shown unreliable for
+    # vehicle content would re-amplify the exact problem this rebalance
+    # exists to fix. FACE composite keeps the protection it was originally
+    # built for.
+    #
+    # BUG FIX (15 Aug 2026): this comment always said "FACE-only", but the
+    # code actually gated on `not has_vehicle` - which silently also
+    # applies to OTHER-bucket content, never validated either way. Real
+    # batch evidence (15 Aug 2026, 36-image Colab run): two genuine real
+    # vehicle photos (21.44.28.jpeg, 21.54.16 (1).jpeg) were misrouted by
+    # router.py to OTHER instead of VEHICLE, which let them fall through
+    # this exact gate and inherit a mechanism validated only on faces -
+    # contributing to false-positive scores of 92.4% and 99.1% on ordinary
+    # real photos. Changed to explicit `has_face` so OTHER gets the same
+    # protection VEHICLE already has, regardless of whether the router
+    # classified the content correctly.
+    if has_face:
         ai_gen_composite = max(ai_gen_composite, dl_ai * DL_AI_FLOOR)
     if has_vehicle:
         ai_gen_composite = max(ai_gen_composite, vehicle_val * VEHICLE_FLOOR)
@@ -260,7 +329,17 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
     # WhatsApp vehicle photo) showed this ceiling take a properly-blended
     # 59.6% straight to 98.8% off ONE ensemble member's false-positive
     # read - the opposite of what it's meant to protect against.
-    if dl_ai_ensemble_max >= DL_AI_CONCLUSIVE_THRESHOLD and not has_vehicle \
+    #
+    # BUG FIX (15 Aug 2026): same gap as DL_AI_FLOOR above - this comment
+    # always said "FACE-only" but the code gated on `not has_vehicle`,
+    # silently including OTHER-bucket content too. Real batch evidence
+    # (15 Aug 2026): two genuine real vehicle photos misrouted to OTHER by
+    # router.py inherited this ceiling and were pushed to 92.4%/99.1% off
+    # the same kind of single-model false-positive read the 4 Aug fix was
+    # written to stop for VEHICLE - just via a different bucket. Changed
+    # to explicit `has_face` so a router misroute can no longer bypass
+    # this protection for either non-face content type.
+    if dl_ai_ensemble_max >= DL_AI_CONCLUSIVE_THRESHOLD and has_face \
             and exif_real < EXIF_CONCLUSIVE_REAL:
         ai_gen_composite = max(ai_gen_composite, dl_ai_ensemble_max)
 
@@ -284,8 +363,34 @@ def _compute_image_composites(stage: dict, has_face: bool = True, has_vehicle: b
     #    light can legitimately have low sensor noise too, so this must not
     #    fire when strong real-camera EXIF already contradicts it - this was
     #    the one of the three that structural review found WITHOUT this gate.
+    #
+    # DISABLED (15 Aug 2026) - real evidence, not a guess: ran the actual
+    # pipeline (Colab, real model inference) against 72 genuine, unedited
+    # real face photos from a Kaggle training set. Result: noise_residual_std
+    # was below 3.0 for 58/60 of them (96.7%) - the core assumption this
+    # mechanism is built on ("real photos show std > 3") does not hold on
+    # this data source AT ALL, real or fake alike. It wasn't discriminating
+    # anything; it was applying a near-universal additive tax that happened
+    # to tip borderline cases over AI_GEN_THRESHOLD. Quantified impact:
+    # disabling this ALONE flips 20 of 28 FACE false positives in that batch
+    # back to correctly REAL (46.7% -> 13.3% FP rate on that data source),
+    # confirmed by re-running the real _compute_image_composites() function,
+    # with zero regression on either known-correct FACE hit (b4bdd97c7671:
+    # 97.6 unchanged; 68d50b30b32c: 99.5 -> 96.3, still clearly a hit).
+    #
+    # NOT DELETED, only neutralized (hardcoded False) - this is a "disable
+    # pending better evidence", not "this mechanism is proven wrong for all
+    # data". The reverse case (does it correctly catch AI faces with EXIF
+    # stripped) has never been tested at scale, only assumed at design time.
+    # Re-enable only after checking noise_residual_std's actual distribution
+    # on a labeled AI-generated-face set of comparable size - if AI faces
+    # from THIS pipeline's actual model sources also cluster low-noise after
+    # typical resize/compress handling (plausible, given how uniformly real
+    # photos did here), this signal may not be salvageable as designed at
+    # any threshold, and needs rethinking rather than retuning.
+    _MECHANISM_3_ENABLED = False
     noise_std = float(stage.get('noise_residual_std', 999) or 999)
-    if has_face and noise_std < 3.0 and exif_real < EXIF_CONCLUSIVE_REAL:
+    if _MECHANISM_3_ENABLED and has_face and noise_std < 3.0 and exif_real < EXIF_CONCLUSIVE_REAL:
         noise_contribution = (3.0 - noise_std) / 3.0 * 20.0  # max 20pts at std=0
         ai_gen_composite = min(100.0, ai_gen_composite + noise_contribution)
 
