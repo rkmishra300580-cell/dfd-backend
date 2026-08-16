@@ -34,6 +34,7 @@ from .result import AnalysisResult
 from .helpers import detect_faces, extract_fake_score, apply_graph_style
 from .router import classify_content_type
 from .vehicle_ai_gen_classifier import score_vehicle_domain
+from .photo_edit_classifier import score_photo_edit_domain
 
 # ============================================================================
 # DELIBERATE EXCEPTION to the "all models are permanent singletons" rule
@@ -1259,6 +1260,30 @@ def dl_detector(filepath, pil_image, combined_forensic_score, manip_score,
             R.payload['stage_scores']['vehicle_domain_ai_gen'] = round(vehicle_domain_score, 1)
         else:
             R.add_stat('Vehicle-Domain AI-Gen Score', 'Not yet trained (no labeled AI-generated-vehicle data)')
+
+    # -- Photo-edit-domain classifier (FACE/OTHER buckets, i.e. everything
+    # NOT VEHICLE) ----------------------------------------------------------
+    # See photo_edit_classifier.py docstring (14 Aug 2026): confirmed via
+    # both models' own documentation plus 6 real production reports that
+    # the generic sdxl/umm-maybe ensemble was never validated for "real
+    # photo with local AI editing" - a different task from what either
+    # model was trained on. Same pattern as the vehicle-domain classifier
+    # above: returns None until a labeled dataset exists and
+    # train_and_save() has been run - EXPECTED right now (no such dataset
+    # exists yet), not an error. helpers.py's _compute_image_composites()
+    # already treats None as "signal unavailable" and falls back to the
+    # existing dl_ai/freq/exif weighting that doesn't depend on it.
+    if content_bucket != 'VEHICLE':
+        try:
+            photo_edit_domain_score = score_photo_edit_domain(pil_image)
+        except Exception as e:
+            photo_edit_domain_score = None
+            R.pdf_text(f'Photo-edit-domain classifier failed: {e}  -  falling back to existing signals.')
+        if photo_edit_domain_score is not None:
+            R.add_stat('Photo-Edit-Domain Score', f'{photo_edit_domain_score:.1f}%')
+            R.payload['stage_scores']['photo_edit_domain'] = round(photo_edit_domain_score, 1)
+        else:
+            R.add_stat('Photo-Edit-Domain Score', 'Not yet trained (no labeled AI-edited-photo data)')
 
     R.add_stat('DL Deepfake Score', f'{dl_deepfake_score:.1f}%')
     R.add_stat('DL Deepfake Label', matched_label)
