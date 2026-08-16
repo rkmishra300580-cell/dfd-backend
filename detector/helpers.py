@@ -655,7 +655,8 @@ def classify_dominant(payload: dict) -> dict:
                                        file_type=file_type,
                                        editing_detected=editing_detected,
                                        manipulation_type=manipulation_type,
-                                       risk_level=risk_level)
+                                       risk_level=risk_level,
+                                       effective_threshold=effective_threshold)
 
     return {
         # ── New fields (dominant classification) ──────────────────────────────
@@ -875,7 +876,8 @@ def verdict_text_v2(classification: str, dominant_score: float,
                     file_type: str = 'IMAGE',
                     editing_detected: bool = False,
                     manipulation_type: str = None,
-                    risk_level: str = None) -> dict:
+                    risk_level: str = None,
+                    effective_threshold: float = SYNTHETIC_THRESHOLD) -> dict:
     """
     Legally safe verdict language tied to dominant classification.
     Avoids definitive statements. Phrasing is modality-aware - "captured by
@@ -934,11 +936,49 @@ def verdict_text_v2(classification: str, dominant_score: float,
                 f'and should be verified by a qualified analyst before being used as evidence.'
             )
         else:
-            verdict = (
-                'No significant indicators of synthetic manipulation were detected. '
-                'Content appears consistent with authentic, unedited media under '
-                'current forensic analysis.'
-            )
+            # BUG FIX (16 Aug 2026): this was the ONE branch of the four
+            # in this function that ignored deepfake_score/ai_gen_score
+            # entirely and returned a static string, even though both were
+            # already being passed in - every other branch (DEEPFAKE,
+            # AI_GENERATED, REAL+EDITED) interpolates score_str into its
+            # text. Found from a real production case (two real vehicle
+            # photos, one with AI-added damage): synthetic_score landed at
+            # 44.6 and 43.0, a hair under SYNTHETIC_THRESHOLD=45.0, with
+            # DL AI-Generated individually reading 80%+ - and both got the
+            # exact same "No significant indicators... consistent with
+            # authentic, unedited media" text as a genuinely clean 2% real
+            # photo would. The classification (REAL) was correct per the
+            # threshold, but the language asserted a confidence the
+            # evidence didn't support - a real photo that barely missed
+            # being flagged is not the same claim as one with no evidence
+            # at all, and the previous text made no distinction.
+            #
+            # BORDERLINE_MARGIN=10.0 is a first-pass judgment call, NOT
+            # validated against labeled data (no equivalent of evaluate.py
+            # exists yet for verdict-text calibration) - flagged the same
+            # way any other untuned threshold in this codebase should be.
+            # Revisit once there's a labeled set of near-threshold real
+            # photos to check this reads correctly across more cases than
+            # the two that prompted it.
+            synthetic_score = max(deepfake_score, ai_gen_score)
+            margin = effective_threshold - synthetic_score
+            BORDERLINE_MARGIN = 10.0
+            if 0 <= margin < BORDERLINE_MARGIN:
+                verdict = (
+                    f'No single check crossed the threshold for a synthetic '
+                    f'classification, but the combined signal ({synthetic_score:.0f}/100) '
+                    f'came close to it (threshold: {effective_threshold:.0f}/100) - some '
+                    f'individual checks showed real evidence on their own (see Stage Score '
+                    f'Breakdown), they simply weren\'t decisive together. This result should '
+                    f'be treated as inconclusive rather than a confident REAL, and warrants '
+                    f'closer manual review before being relied on.'
+                )
+            else:
+                verdict = (
+                    'No significant indicators of synthetic manipulation were detected. '
+                    'Content appears consistent with authentic, unedited media under '
+                    'current forensic analysis.'
+                )
     elif classification == 'DEEPFAKE':
         if manipulation_type == 'EDITED':
             # Defensive fallback only - as of 28 Jul 2026 this combination
