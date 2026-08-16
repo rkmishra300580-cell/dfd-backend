@@ -534,17 +534,41 @@ def classify_dominant(payload: dict) -> dict:
     real_score         = float(max(0, 100 - synthetic_score))
 
     # ── Effective threshold: raised when camera EXIF signals present ──────────
-    # exif_real > 0 means some camera metadata exists. A real photo with even
-    # partial camera EXIF needs a stronger synthetic signal to be overridden.
-    # exif_real=15 raises threshold 45→49.5; exif_real=65 raises it to 64.5.
+    # exif_real > 0 means some camera metadata exists. exif_real=15 raises
+    # the AI-GEN threshold 45->49.5; exif_real=65 raises it to 64.5.
     # Only applies to IMAGE modality where exif_real is computed.
+    #
+    # SCOPE FIX (16 Aug 2026): this boost previously applied to
+    # synthetic_score = max(deepfake_composite, ai_gen_composite) as a
+    # single merged value - i.e. genuine camera EXIF raised the bar for
+    # BOTH tracks equally. That's backwards for one of them. Genuine EXIF
+    # is real evidence against full fabrication (AI_GENERATED) - a
+    # wholesale AI-generated image never passed through a camera. It is
+    # NOT evidence against local editing of an otherwise-real photo
+    # (DEEPFAKE) - the EXIF survives editing precisely because editing
+    # tools don't strip it, and a fraudster has every incentive to KEEP
+    # genuine EXIF intact since it makes the fraud look more convincing,
+    # not less. Confirmed directly on a real case (9f51a1c1a9a3, 16 Aug
+    # 2026: a real vehicle photo with AI-added damage, genuine iPhone 16
+    # EXIF/GPS intact, exif_real=65, DL AI-Generated=80.6% raw) - the
+    # merged boost pushed the bar to 64.5 for BOTH tracks, including the
+    # deepfake track, where intact EXIF says nothing relevant at all.
+    # Now split: the boost only applies to the AI-GEN threshold.
     exif_real_for_threshold = float(stage.get('exif_real_score', 0) or 0)
-    effective_threshold = SYNTHETIC_THRESHOLD + exif_real_for_threshold * 0.30
+    effective_ai_gen_threshold = SYNTHETIC_THRESHOLD + exif_real_for_threshold * 0.30
+    effective_deepfake_threshold = SYNTHETIC_THRESHOLD  # no EXIF boost - see above
+    # Kept for callers/verdict text that want "the threshold relevant to
+    # whichever track is actually dominant" as a single number, rather than
+    # forcing every caller to know about both tracks separately.
+    effective_threshold = (
+        effective_ai_gen_threshold if ai_gen_composite >= deepfake_composite
+        else effective_deepfake_threshold
+    )
 
     has_face = stage.get('face_forensics') is not None
 
     # ── Two-level decision ────────────────────────────────────────────────────
-    if synthetic_score < effective_threshold:
+    if deepfake_composite < effective_deepfake_threshold and ai_gen_composite < effective_ai_gen_threshold:
         # Neither the deepfake nor AI-generation track crossed the bar - but
         # editing evidence (Photoshop/Lightroom tag + forensic corroboration)
         # is a SEPARATE, third signal checked here.
