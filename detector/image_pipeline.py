@@ -1121,6 +1121,28 @@ def vehicle_damage_analysis(filepath, pil_image, R: AnalysisResult):
     R.add_stat('Vehicle Damage Score', f'{vehicle_score:.1f}%')
     R.payload['stage_scores']['vehicle_damage'] = round(vehicle_score, 1)
 
+    # DIAGNOSTIC FIX (16 Aug 2026): the 5 individual sub-scores that get
+    # weighted into vehicle_score were never exposed in stage_scores, only
+    # the final combined number - same gap already found and fixed in
+    # audio_pipeline.py. Confirmed need: on the two known real fraud cases
+    # this session (9f51a1c1a9a3, 667e284bf567), 'boundary' read 0% in
+    # BOTH despite both being genuinely AI-edited (boundary_std=52-55,
+    # nowhere near the <15/<25 threshold that would fire it) - the same
+    # shape of stale-assumption problem already found and fixed in
+    # audio's MFCC Variance. 'damage_ela' and 'texture' were the only
+    # consistently strong signals in both cases. This is diagnostic only -
+    # does NOT change vehicle_score or any weight; it only exposes what's
+    # already computed, so the next batch of real+fake vehicle photos run
+    # through Colab actually captures enough detail to reweight safely,
+    # the same real-evidence-first process used for the audio fix. Do NOT
+    # reweight veh_weights off the 2 cases available right now - that's
+    # the exact one-sided-tuning mistake this project started by flagging.
+    R.payload['stage_scores']['vehicle_damage_ela']       = round(component_scores.get('damage_ela', 0), 1)
+    R.payload['stage_scores']['vehicle_shadow']           = round(component_scores.get('shadow', 0), 1)
+    R.payload['stage_scores']['vehicle_texture']          = round(component_scores.get('texture', 0), 1)
+    R.payload['stage_scores']['vehicle_boundary']         = round(component_scores.get('boundary', 0), 1)
+    R.payload['stage_scores']['vehicle_insurance_meta']   = round(component_scores.get('insurance_meta', 0), 1)
+
     fig, ax = plt.subplots(figsize=(10, 5))
     labels  = ['Damage\nELA', 'Shadow\nConsistency', 'Texture\nConsistency', 'Boundary\nAnalysis', 'Insurance\nMetadata']
     values  = [component_scores.get(k, 0) for k in ['damage_ela', 'shadow', 'texture', 'boundary', 'insurance_meta']]
