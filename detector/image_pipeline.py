@@ -1,6 +1,6 @@
 """
 Image analysis pipeline  -  five-stage fusion architecture:
-  Stage 1: frequency_domain_analysis()    -  FFT/spectral forensics
+  Stage 1: frequency_domain_analysis()    -  FFT/spectral forensics 
   Stage 2: face_forensic_analysis()       -  face/region forensics (human faces only)
   Stage 3: manipulation_analysis()        -  ELA, copy-move, PRNU, metadata, patch analysis
   Stage 4: vehicle_damage_analysis()      -  vehicle/object damage forensics (runs when no human face)
