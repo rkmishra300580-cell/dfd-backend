@@ -57,7 +57,27 @@ AI_GEN_THRESHOLD     = 45.0
 # REAL classify_dominant() function and its actual thresholds (not an
 # approximation) — an earlier sweep using an assumed 50-point threshold
 # instead of the real 45-point AI_GEN_THRESHOLD wrongly suggested 0.70.
-DL_DEEPFAKE_FLOOR = 0.80   # prithivMLmods — validated, face-specific, high trust
+DL_DEEPFAKE_FLOOR = 0.95   # prithivMLmods — validated, face-specific, high trust
+                            # RAISED from 0.80 (16 Aug 2026) - real paired evidence,
+                            # not a guess: tested against 274 real production
+                            # inference results (60 real + 214 wholesale AI-generated
+                            # faces, consolidated from this session's Colab batches).
+                            # deep_learning (this model's raw score) showed by far the
+                            # cleanest separation of any signal found this session:
+                            # real mean=22.8, fake mean=81.5, fake median=90.3, with
+                            # 113/214 fake images already reading raw >=90. Yet the
+                            # 0.80 floor was silently discounting even these
+                            # near-certain readings, capping most fake scores in the
+                            # 45-79 "not confident enough" range instead of the 80+ a
+                            # genuinely detected case deserves. Tested 0.80/0.90/0.95/
+                            # 1.0 against the real data: 0.90 and 0.95 both show ZERO
+                            # change in real-photo false-positive rate (13.3% at every
+                            # value up to 0.95) while fake scores reaching >=80 jump
+                            # from 11.7% (at 0.80) to 79.0% (at 0.95). 1.0 (no discount
+                            # at all) gains slightly more (83.2%) but at a real,
+                            # non-zero cost (FP rate rises to 16.7%) - 0.95 is the
+                            # better evidenced choice: maximum gain at zero measured
+                            # cost, not the theoretical maximum.
 DL_AI_FLOOR       = 0.60   # sdxl-detector ensemble — unvalidated, lower trust
 # NEW 29 Jul 2026: vehicle_damage_analysis's own heuristics (ELA/shadow/
 # texture/boundary/insurance-metadata) are the most directly relevant signal
