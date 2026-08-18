@@ -702,11 +702,34 @@ def classify_dominant(payload: dict) -> dict:
                                        risk_level=risk_level,
                                        effective_threshold=effective_threshold)
 
+    # ── Confidence (16 Aug 2026) — for the simplified screen display ─────────
+    # Product decision: show ONE label (classification) + ONE confidence
+    # number, no "high/low" adjective attached - the number should speak for
+    # itself. That only works if it measures DISTANCE FROM THE DECISION
+    # THRESHOLD, not the raw synthetic_score - a raw score has the exact
+    # same "is 52% high or low?" ambiguity the old UI had, just renamed.
+    # 50% = sitting exactly on the threshold (maximally undecided, whichever
+    # side it fell on). 100% = at either extreme (raw score of 0 or 100).
+    # Uses effective_threshold (not the flat SYNTHETIC_THRESHOLD) so the
+    # EXIF-adjusted boundary from the 16 Aug scope fix is respected - a case
+    # sitting just above a boosted 64.5 threshold is read as LESS confident
+    # than the same raw score above the base 45.0 would be, correctly.
+    if synthetic_score >= effective_threshold:
+        # room to climb from the threshold up to 100
+        span = max(100.0 - effective_threshold, 1e-6)
+        confidence = 50.0 + (synthetic_score - effective_threshold) / span * 50.0
+    else:
+        # room to fall from the threshold down to 0
+        span = max(effective_threshold, 1e-6)
+        confidence = 50.0 + (effective_threshold - synthetic_score) / span * 50.0
+    confidence = float(min(max(confidence, 50.0), 100.0))
+
     return {
         # ── New fields (dominant classification) ──────────────────────────────
         'classification':      classification,
         'dominant_score':      round(dominant_score, 1),
         'dominant_label':      dominant_label,      # e.g. "78% DEEPFAKE" or "64% DEEPFAKE (Edited)"
+        'confidence':          round(confidence, 1),  # distance-from-threshold, NOT raw score - see comment above
         'real_score':          round(real_score, 1),
         'ai_generated_score':  round(ai_gen_composite, 1),
         'deepfake_score':      round(deepfake_composite, 1),
