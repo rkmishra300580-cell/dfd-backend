@@ -527,6 +527,23 @@ class AnalysisResult:
         stage_scores   = self.payload.get("stage_scores", {})
         classification = self.payload.get("classification", "UNKNOWN")
         real_score     = float(self.payload.get("real_score", 0))
+        # BUG FIX (18 Aug 2026): the screen (page.js VerdictHero) was
+        # redesigned to show ONE label + a distance-from-threshold
+        # "confidence" number (helpers.py classify_dominant's 'confidence'
+        # field) instead of the raw score, specifically because a raw score
+        # right next to a confident-sounding label was misleading at
+        # borderline results. The PDF was never updated to match - it kept
+        # headlining the raw score (e.g. "61.2% AUTHENTICITY SCORE") with no
+        # mention of confidence at all, so a report showing "Confidence: 57%"
+        # on screen and "61.2%" as the PDF's big number look like two
+        # different, disagreeing results, even though both are computed from
+        # the exact same payload. Confirmed directly: report 7c6d944bf22b
+        # showed Confidence 57% on screen vs 61.2% Authenticity Score in the
+        # PDF - correct math on both sides, but no shared anchor between
+        # them. Reads it here with the same default (50.0, "exactly at the
+        # threshold") verdict_text_v2 and page.js already use for payloads
+        # that predate this field.
+        confidence     = float(self.payload.get("confidence", 50.0))
         # NEW (4 Aug 2026, part of the same display_score fix below): needed
         # so the header LABEL can also distinguish REAL (Edited) from plain
         # REAL, not just the number. See _draw_cover/_draw_verdict_page.
@@ -588,6 +605,7 @@ class AnalysisResult:
             display_score=display_score, threat=threat, verdict=verdict,
             stage_scores=stage_scores, classification=classification,
             score=score, editing_detected=editing_detected, stats=stats,
+            confidence=confidence,
         )
 
         buf = io.BytesIO()
@@ -599,6 +617,7 @@ class AnalysisResult:
             display_score=display_score, threat=threat, verdict=verdict,
             stage_scores=stage_scores, classification=classification,
             score=score, editing_detected=editing_detected, stats=stats,
+            confidence=confidence,
         )
 
         c.save()
@@ -608,7 +627,7 @@ class AnalysisResult:
 
     def _render_pages(self, c, total_pages, filename, file_type, display_score,
                        threat, verdict, stage_scores, classification, score,
-                       editing_detected, stats):
+                       editing_detected, stats, confidence=50.0):
         """
         Draws every page of the report onto canvas c, using total_pages as
         the header denominator throughout. Returns the true final page_num
@@ -624,7 +643,7 @@ class AnalysisResult:
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
-        self._draw_cover(c, display_score, threat, verdict, stage_scores, file_type, filename, classification, score, editing_detected)
+        self._draw_cover(c, display_score, threat, verdict, stage_scores, file_type, filename, classification, score, editing_detected, confidence)
         c.showPage()
         page_num += 1
 
@@ -652,7 +671,7 @@ class AnalysisResult:
 
     # -- Internal PDF builders -------------------------------------------------
 
-    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', raw_score=0.0, editing_detected=False):
+    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', raw_score=0.0, editing_detected=False, confidence=50.0):
         v_col = _verdict_color(threat)
         content_top = PAGE_H - MARGIN_T - HEADER_H - 6 * mm
 
@@ -690,6 +709,30 @@ class AnalysisResult:
         c.setFillColor(C_DARK)
         c.roundRect(MARGIN_L, y - card_h, CONTENT_W, card_h, 5, fill=1, stroke=0)
 
+        # BUG FIX (18 Aug 2026): screen shows CLASSIFICATION + a distance-
+        # from-threshold "confidence" number as its only headline (see
+        # build_pdf's confidence comment above) - this PDF number is a
+        # different, raw-score concept, correct on its own terms but with
+        # no visible anchor back to what the reader saw on screen. Drawn
+        # here as its own clearly-labeled line, matching the screen exactly
+        # (same 'confidence' field, same classification label) - not
+        # replacing the raw score below, which stays as legitimate detail,
+        # but giving the reader an immediate "yes, this is the same report"
+        # checkpoint before the raw technical numbers. Placed in the
+        # previously-unused header space at the top of the score card - the
+        # 44pt score number's baseline sits at y-25mm with real vertical
+        # extent both above and below that, so this must NOT share that
+        # band; y-6mm is comfortably clear of it.
+        classification_display = {
+            'REAL': 'REAL', 'AI_GENERATED': 'AI GENERATED', 'DEEPFAKE': 'DEEPFAKE',
+        }.get(classification, classification)
+        if classification == "REAL" and editing_detected:
+            classification_display = 'REAL (Edited)'
+        c.setFont(FONT_B, 9)
+        c.setFillColor(v_col)
+        c.drawString(MARGIN_L + 8 * mm, y - 6 * mm,
+                     f"App shows: {classification_display}  \u00b7  Confidence: {confidence:.0f}%")
+
         c.setFont(FONT_B, 44)
         c.setFillColor(v_col)
         c.drawString(MARGIN_L + 8 * mm, y - 25 * mm, f"{score:.1f}%")
@@ -711,6 +754,7 @@ class AnalysisResult:
         else:
             prob_label = "MANIPULATION PROBABILITY"
         c.drawString(MARGIN_L + 8 * mm, y - card_h + 5 * mm, prob_label)
+
         # Secondary note only for plain REAL (not edited): for REAL (Edited),
         # raw_score (=final_score) now equals the headline number exactly
         # (both are edit_composite - see the display_score fix above), so
