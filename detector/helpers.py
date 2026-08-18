@@ -99,6 +99,15 @@ VEHICLE_FLOOR     = 0.60   # vehicle_damage_analysis — unvalidated, needs eval
 # raw max score, not the averaged dl_ai used everywhere else - see that
 # ceiling's comment for the real case and the known trade-off.
 DL_AI_CONCLUSIVE_THRESHOLD = 90.0
+# How close synthetic_score has to sit below effective_threshold to count as
+# "borderline REAL" rather than a clean REAL. MOVED (18 Aug 2026) from a
+# local var buried inside verdict_text_v2 to here, and computed ONCE in
+# classify_dominant() instead of privately re-derived by verdict_text_v2 -
+# see classify_dominant()'s 'borderline' field for why. Same value (10.0),
+# same UNVALIDATED status as before: a first-pass judgment call from the
+# two cases that prompted the original verdict-text fix, not checked
+# against labeled near-threshold data. Do not raise/lower without that.
+BORDERLINE_MARGIN = 10.0
 
 
 # ── Per-modality composite score functions ────────────────────────────────────
@@ -585,6 +594,24 @@ def classify_dominant(payload: dict) -> dict:
         else effective_deepfake_threshold
     )
 
+    # ── Borderline flag (18 Aug 2026) ─────────────────────────────────────────
+    # BUG FIX: this margin check used to live ONLY inside verdict_text_v2,
+    # computed privately and used solely to soften the verdict PARAGraph's
+    # wording near a threshold. Nothing else in the payload knew a result
+    # was borderline - risk_level's REAL branch (below) and result.py's PDF
+    # cover label (_confidence_category) each had NO visibility into it and
+    # independently treated every REAL result identically regardless of
+    # margin, producing a real, confirmed report (6bca18a2a75a, 18 Aug 2026)
+    # where the verdict paragraph said "should be treated as inconclusive...
+    # not a confident REAL" while the badge above it read "LIKELY REAL" /
+    # "LOW" risk in the same breath - two different readings of the exact
+    # same synthetic_score/effective_threshold pair, because only one of the
+    # two consumers ever saw the margin. Computed once here, exposed as a
+    # real field, and both risk_level and verdict_text_v2 now read this
+    # single value instead of each deciding for itself.
+    margin = effective_threshold - synthetic_score
+    borderline = bool(0 <= margin < BORDERLINE_MARGIN)
+
     has_face = stage.get('face_forensics') is not None
 
     # ── Two-level decision ────────────────────────────────────────────────────
@@ -668,7 +695,14 @@ def classify_dominant(payload: dict) -> dict:
     # LOW is never the right tier for a confirmed positive finding,
     # regardless of exactly how far past its threshold the score landed.
     if classification == 'REAL' and not editing_detected:
-        risk_level = 'LOW'
+        # BUG FIX (18 Aug 2026): previously flat 'LOW' regardless of how
+        # close synthetic_score sat to effective_threshold - see the
+        # 'borderline' comment above for the real report this produced a
+        # visible mismatch on. A borderline REAL (barely didn't cross the
+        # bar) reuses the existing MODERATE tier rather than a new one -
+        # per product decision, same word already used for a weak-but-
+        # present synthetic finding, not inventing a fifth tier.
+        risk_level = 'MODERATE' if borderline else 'LOW'
     elif dominant_score < 65:
         risk_level = 'MODERATE'
     elif dominant_score < 80:
@@ -700,7 +734,8 @@ def classify_dominant(payload: dict) -> dict:
                                        editing_detected=editing_detected,
                                        manipulation_type=manipulation_type,
                                        risk_level=risk_level,
-                                       effective_threshold=effective_threshold)
+                                       effective_threshold=effective_threshold,
+                                       borderline=borderline)
 
     # ── Confidence (16 Aug 2026) — for the simplified screen display ─────────
     # Product decision: show ONE label (classification) + ONE confidence
@@ -735,6 +770,7 @@ def classify_dominant(payload: dict) -> dict:
         'deepfake_score':      round(deepfake_composite, 1),
         'edited_score':        round(edit_composite, 1),   # editing signal strength
         'editing_detected':    editing_detected,  # True → classification is REAL via the editing track specifically ("REAL (Edited)"), not a synthetic classification
+        'borderline':          borderline,  # True → synthetic_score sat within BORDERLINE_MARGIN of effective_threshold without crossing it. See comment above where this is computed. Only meaningful when classification=='REAL'; both risk_level and verdict_text_v2 read this same value, not private copies.
         'manipulation_type':   manipulation_type, # 'FACE_SWAP' | 'MANIPULATION' | 'EDITED' | None — 'EDITED' now pairs with classification='REAL'; 'FACE_SWAP'/'MANIPULATION' pair with classification='DEEPFAKE'
         'risk_level':          risk_level,
         # ── Updated legacy fields ─────────────────────────────────────────────
@@ -944,7 +980,8 @@ def verdict_text_v2(classification: str, dominant_score: float,
                     editing_detected: bool = False,
                     manipulation_type: str = None,
                     risk_level: str = None,
-                    effective_threshold: float = SYNTHETIC_THRESHOLD) -> dict:
+                    effective_threshold: float = SYNTHETIC_THRESHOLD,
+                    borderline: bool = False) -> dict:
     """
     Legally safe verdict language tied to dominant classification.
     Avoids definitive statements. Phrasing is modality-aware - "captured by
@@ -1027,10 +1064,17 @@ def verdict_text_v2(classification: str, dominant_score: float,
             # Revisit once there's a labeled set of near-threshold real
             # photos to check this reads correctly across more cases than
             # the two that prompted it.
+            #
+            # REFACTOR (18 Aug 2026): this used to recompute margin/
+            # BORDERLINE_MARGIN privately, right here, invisible to every
+            # other consumer of the same classify_dominant() result -
+            # see classify_dominant()'s 'borderline' comment for the real
+            # report that mismatch produced. Now reads the single shared
+            # flag computed once in classify_dominant, same threshold
+            # (BORDERLINE_MARGIN, now module-level), same math - no
+            # behavior change here, only removing the second copy.
             synthetic_score = max(deepfake_score, ai_gen_score)
-            margin = effective_threshold - synthetic_score
-            BORDERLINE_MARGIN = 10.0
-            if 0 <= margin < BORDERLINE_MARGIN:
+            if borderline:
                 verdict = (
                     f'No single check crossed the threshold for a synthetic '
                     f'classification, but the combined signal ({synthetic_score:.0f}/100) '
