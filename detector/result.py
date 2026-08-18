@@ -62,7 +62,8 @@ def _verdict_color(threat: str):
     return C_TEXT_MID
 
 
-def _confidence_category(classification: str, threat: str, editing_detected: bool = False) -> str:
+def _confidence_category(classification: str, threat: str, editing_detected: bool = False,
+                          borderline: bool = False) -> str:
     """
     Plain-language category label to sit above the raw threat word on the
     PDF cover, mirroring the same borderline/confident distinction added to
@@ -71,10 +72,29 @@ def _confidence_category(classification: str, threat: str, editing_detected: boo
     same layout, same font sizes, only the word and color differed. This
     doesn't replace the threat word or its color-coding (both stay exactly
     as before); it adds one short line of context above it.
+
+    BUG FIX (18 Aug 2026): the REAL branch used to be an unconditional
+    'Likely real' (or 'Likely real, edited') regardless of how close the
+    result actually sat to the decision threshold - the AI_GENERATED/
+    DEEPFAKE branch right below it already had this exact distinction
+    (`t in ('HIGH','CRITICAL')` vs 'Needs review — signal is weak'), but
+    REAL was never given the equivalent, and couldn't have used `threat`
+    for it anyway since helpers.py's risk_level was flatly 'LOW' for every
+    REAL result regardless of margin (see that fix, same date). Confirmed
+    on a real report (6bca18a2a75a): verdict paragraph said "should be
+    treated as inconclusive... not a confident REAL" while this line said
+    "Likely real" three inches above it. Now reads the same `borderline`
+    flag classify_dominant() computes once and exposes, same value the
+    verdict paragraph itself is built from - no more private judgment call
+    at each display site.
     """
     t = (threat or '').upper()
     if classification == 'REAL':
-        return 'Likely real, edited' if editing_detected else 'Likely real'
+        if editing_detected:
+            return 'Likely real, edited'
+        if borderline:
+            return 'Borderline — treat as inconclusive'
+        return 'Likely real'
     if classification in ('AI_GENERATED', 'DEEPFAKE'):
         if t in ('HIGH', 'CRITICAL'):
             return 'Strong AI-generation signal' if classification == 'AI_GENERATED' else 'Strong deepfake signal'
@@ -522,11 +542,25 @@ class AnalysisResult:
         filename    = self.payload.get("filename", "unknown")
         file_type   = self.payload.get("file_type", "")
         score          = float(self.payload.get("final_score", 0))
-        threat         = self.payload.get("threat_level", "UNKNOWN")
+        # BUG FIX (18 Aug 2026): this read ONLY the legacy, score-band
+        # threat_level (threat_from_score(legacy_score) - e.g. 25-49 ->
+        # 'LOW' unconditionally, with no awareness of classification or how
+        # close the score sat to its decision threshold). page.js already
+        # prefers the newer, margin-aware risk_level and only falls back to
+        # threat_level for older payloads (see VerdictHero: `result.risk_level
+        # || result.threat_level`) - the PDF and screen were silently
+        # reading two different severity fields for the same result.
+        # Confirmed on a real report (6bca18a2a75a, 18 Aug 2026): a
+        # borderline REAL result (6-point margin) showed "LOW" on the PDF
+        # cover purely because 38.8 falls in the 25-49 legacy band, with no
+        # connection to the verdict paragraph's own "treat as inconclusive"
+        # language. Same fallback pattern as page.js now applied here.
+        threat         = self.payload.get("risk_level") or self.payload.get("threat_level", "UNKNOWN")
         verdict        = self.payload.get("verdict", "")
         stage_scores   = self.payload.get("stage_scores", {})
         classification = self.payload.get("classification", "UNKNOWN")
         real_score     = float(self.payload.get("real_score", 0))
+        borderline     = bool(self.payload.get("borderline", False))
         # BUG FIX (18 Aug 2026): the screen (page.js VerdictHero) was
         # redesigned to show ONE label + a distance-from-threshold
         # "confidence" number (helpers.py classify_dominant's 'confidence'
@@ -605,7 +639,7 @@ class AnalysisResult:
             display_score=display_score, threat=threat, verdict=verdict,
             stage_scores=stage_scores, classification=classification,
             score=score, editing_detected=editing_detected, stats=stats,
-            confidence=confidence,
+            confidence=confidence, borderline=borderline,
         )
 
         buf = io.BytesIO()
@@ -617,7 +651,7 @@ class AnalysisResult:
             display_score=display_score, threat=threat, verdict=verdict,
             stage_scores=stage_scores, classification=classification,
             score=score, editing_detected=editing_detected, stats=stats,
-            confidence=confidence,
+            confidence=confidence, borderline=borderline,
         )
 
         c.save()
@@ -627,7 +661,7 @@ class AnalysisResult:
 
     def _render_pages(self, c, total_pages, filename, file_type, display_score,
                        threat, verdict, stage_scores, classification, score,
-                       editing_detected, stats, confidence=50.0):
+                       editing_detected, stats, confidence=50.0, borderline=False):
         """
         Draws every page of the report onto canvas c, using total_pages as
         the header denominator throughout. Returns the true final page_num
@@ -643,7 +677,7 @@ class AnalysisResult:
         _draw_watermark(c)
         _draw_header(c, self.job_id, page_num, total_pages)
         _draw_footer(c, filename, self._generated_at)
-        self._draw_cover(c, display_score, threat, verdict, stage_scores, file_type, filename, classification, score, editing_detected, confidence)
+        self._draw_cover(c, display_score, threat, verdict, stage_scores, file_type, filename, classification, score, editing_detected, confidence, borderline)
         c.showPage()
         page_num += 1
 
@@ -671,7 +705,7 @@ class AnalysisResult:
 
     # -- Internal PDF builders -------------------------------------------------
 
-    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', raw_score=0.0, editing_detected=False, confidence=50.0):
+    def _draw_cover(self, c, score, threat, verdict, stage_scores, file_type, filename, classification='UNKNOWN', raw_score=0.0, editing_detected=False, confidence=50.0, borderline=False):
         v_col = _verdict_color(threat)
         content_top = PAGE_H - MARGIN_T - HEADER_H - 6 * mm
 
@@ -773,7 +807,7 @@ class AnalysisResult:
 
         c.setFont(FONT_R, 7.5)
         c.setFillColor(C_TEXT_LIGHT)
-        c.drawString(div_x + 6 * mm, y - 9 * mm, _confidence_category(classification, threat, editing_detected).upper())
+        c.drawString(div_x + 6 * mm, y - 9 * mm, _confidence_category(classification, threat, editing_detected, borderline).upper())
 
         c.setFont(FONT_B, 18)
         c.setFillColor(v_col)
