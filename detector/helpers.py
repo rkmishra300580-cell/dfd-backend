@@ -612,7 +612,29 @@ def classify_dominant(payload: dict) -> dict:
     margin = effective_threshold - synthetic_score
     borderline = bool(0 <= margin < BORDERLINE_MARGIN)
 
-    has_face = stage.get('face_forensics') is not None
+    # BUG FIX (20 Aug 2026): this was the THIRD occurrence of the exact bug
+    # already fixed once for has_face_for_composite above (see that comment,
+    # 29 Jul 2026) - a private, router-independent has_face determination
+    # that the original fix never reached because it lives in a different
+    # function further down. Confirmed live on a real batch (20 Aug 2026):
+    # a VEHICLE-bucket image (router-confirmed) classified DEEPFAKE got
+    # manipulation_type='FACE_SWAP' instead of 'MANIPULATION' purely
+    # because a person was visible in the vehicle photo (Haar detected a
+    # face at 66.7% - a common pattern in real insurance-claim photos,
+    # e.g. someone standing next to their damaged car) - mislabeling
+    # vehicle-domain fraud as a face-swap downstream, including in
+    # filter_indicators() which reads manipulation_type. Now reuses
+    # has_face_for_composite (file_type=='IMAGE' only; defined above,
+    # already correctly router-derived) instead of re-deriving from raw
+    # Haar output a second time. For non-IMAGE file types (VIDEO/AUDIO/
+    # DOCUMENT), has_face_for_composite is never assigned, so this falls
+    # back to the original raw-Haar check exactly as before - video's own
+    # has_human_face flag has its own separate, already-correct handling
+    # elsewhere and is unaffected by this.
+    has_face = (
+        has_face_for_composite if file_type == 'IMAGE'
+        else stage.get('face_forensics') is not None
+    )
 
     # ── Two-level decision ────────────────────────────────────────────────────
     if deepfake_composite < effective_deepfake_threshold and ai_gen_composite < effective_ai_gen_threshold:
