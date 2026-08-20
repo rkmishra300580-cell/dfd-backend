@@ -136,34 +136,62 @@ def analyze_audio(filepath, R: AnalysisResult):
     plt.close(fig)
 
     # ── Component scoring ─────────────────────────────────────────────────
-    # REWEIGHTED (16 Aug 2026) - real paired evidence, not a guess:
-    # ran the actual pipeline against 74 known-synthetic (TTS, Kaggle) and
-    # 8 known-real (genuine recordings) audio files.
+    # REWEIGHTED AGAIN (20 Aug 2026) - the 16 Aug weighting below (kept in
+    # this comment for history) was validated on only 8 real voices and 74
+    # TTS clips from a single source. Two much larger batches confirmed
+    # that sample was too small and too narrow to trust: 159 real voices
+    # (Kaggle) + 396 TTS clips across TWO independently-sourced fake
+    # batches (200 + 196, engine(s) unconfirmed but results reproduced
+    # closely across both - see the numbers below), 555 files total.
     #
-    # MFCC Variance and Phase Irregularity are DROPPED (weight 0) - both
-    # confirmed dead on BOTH classes, not just weak: MFCC Variance read
-    # exactly 0.0 on every single file in both batches (82/82, zero
-    # exceptions) and Phase Irregularity sat in an ~87-88 band regardless
-    # of content (real: 87.2 constant; TTS: 88.2-88.7). Neither is
-    # discriminating anything - they were unconditionally diluting every
-    # score by 40% of the total weight toward two fixed, uninformative
-    # values, on top of everything.
+    # What held up: MFCC Variance and Phase Irregularity are STILL dead
+    # (MFCC Variance = 0.0 on all 159+396 = 555 files, zero exceptions;
+    # Phase Irregularity flat at ~87.2 regardless of content) - the 16 Aug
+    # decision to zero both was correct and needed no revision.
     #
-    # The remaining three all showed real separation on the same paired
-    # data (real mean -> TTS mean): Spectral Flatness 3.1->12.8, ZCR
-    # Abnormality 26.5->68.9 (by far the largest gap), Bandwidth Anomaly
-    # 9.4->33.4. ZCR Abnormality weighted 3x tripled TTS recall (17/74 ->
-    # 52/74, 23%->70%) with ZERO precision cost on the real-voice sample
-    # (still 8/8 correctly REAL) - confirmed by testing multiple weighting
-    # schemes against the real data, not chosen a priori. Pushing to
-    # ZCR-only recovers more recall (63/74, 85%) but starts costing real
-    # precision (6/8) - not worth the trade at this sample size.
+    # What did NOT hold up: ZCR Abnormality, weighted 3x on the strength of
+    # an 8-file real sample, showed only a +6.2 mean gap (real 43.3 -> fake
+    # ~46-50) at 555-file scale - real and fake distributions overlap too
+    # heavily to be useful, and turning its weight up or down moved real
+    # false-positive rate and fake recall in near lockstep (the signature
+    # of a signal carrying almost no real separation, not a calibration
+    # problem). Spectral Flatness was worse than merely weak - it's
+    # INVERTED at scale (real mean 13.9 vs fake mean ~9.1-9.3, consistently
+    # across BOTH independent fake batches) - it was contributing weight in
+    # the wrong direction the entire time the 16 Aug weighting shipped.
     #
-    # CAVEAT: the real-voice sample is only 8 files. "Zero precision cost"
-    # on 8 examples is a promising first signal, not a proven guarantee -
-    # re-validate this weighting as more real-voice data comes in, same as
-    # any other threshold in this codebase that hasn't seen a large,
-    # labeled negative set yet.
+    # Bandwidth Anomaly is the only component with real, reproducible,
+    # correctly-directioned separation: real mean 48.4 (sd 6.8) vs fake
+    # mean 55.6/55.9 (sd 8.4/7.9) - nearly identical across both
+    # independent fake sources, unlike ZCR/Flatness which only ever showed
+    # up strong on the original single small batch. Mixing ZCR back in
+    # even at reduced weight made results WORSE than Bandwidth alone at
+    # every threshold tested - a real-but-weak signal actively hurts when
+    # combined with a stronger one, it doesn't average out harmlessly.
+    #
+    # CALIBRATION NOTE: dropping straight to Bandwidth-Anomaly-only and
+    # comparing against the shared SYNTHETIC_THRESHOLD=45.0 (helpers.py)
+    # was unusable on its own - Bandwidth Anomaly's raw real-voice mean
+    # (48.4) already sits ABOVE 45, giving a 66.0% real false-positive
+    # rate before any weighting is even applied. AUDIO_SYNTHETIC_OFFSET
+    # below corrects this: it's a fixed post-average subtraction, chosen
+    # by sweeping offsets 5/8/10/12/15 against the full 555-file pooled
+    # set and picking the point balancing real FP rate against fake
+    # recall (offset=10 -> 17.6% real FP / 58.3% fake recall). This is a
+    # deliberately conservative pick, not the max-recall point (offset=5
+    # -> 76.3% recall but 35.8% real FP) - flagged as tunable, same as
+    # BORDERLINE_MARGIN elsewhere in this codebase, if the false-positive
+    # tolerance for this product should sit differently. Honest caveat:
+    # even at the chosen point this remains a modest detector (58.3%
+    # recall), a real improvement over the 16 Aug weighting's ~33% recall
+    # at a comparable real FP rate, not a solved problem - most of TTS
+    # detection's available signal in this pipeline currently lives in
+    # ONE feature.
+    #
+    # 16 Aug weighting, superseded above (kept for history, not reproduced
+    # from real-batch validation at the scale this one has):
+    #   MFCC Variance=0, Spectral Flatness=1, Phase Irregularity=0,
+    #   ZCR Abnormality=3, Bandwidth Anomaly=1
     scores = {
         'MFCC Variance'      : float(np.clip((20 - mfcc_std) / 20 * 100, 0, 100)),
         'Spectral Flatness'  : float(np.clip(spec_flat * 500, 0, 100)),
@@ -172,9 +200,16 @@ def analyze_audio(filepath, R: AnalysisResult):
         'Bandwidth Anomaly'  : float(np.clip((3000 - spec_bw) / 30, 0, 100)),
     }
     _COMPONENT_WEIGHTS = {
-        'MFCC Variance': 0, 'Spectral Flatness': 1, 'Phase Irregularity': 0,
-        'ZCR Abnormality': 3, 'Bandwidth Anomaly': 1,
+        'MFCC Variance': 0, 'Spectral Flatness': 0, 'Phase Irregularity': 0,
+        'ZCR Abnormality': 0, 'Bandwidth Anomaly': 1,
     }
+    # See CALIBRATION NOTE above - tunable, first-pass value from a 5-point
+    # offset sweep, not exhaustively optimized. Raising this lowers real
+    # false-positive rate and lowers fake recall together (they moved in
+    # step across the whole sweep); lowering it does the reverse.
+    AUDIO_SYNTHETIC_OFFSET = 10.0
+
+
 
     # ── Graph 3: Dashboard (IMPORTANT)
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -202,7 +237,8 @@ def analyze_audio(filepath, R: AnalysisResult):
     for ind in indicators: R.add_indicator(f'[Audio] {ind}')
 
     forensic_prob = float(np.clip(
-        sum(scores[k] * _COMPONENT_WEIGHTS[k] for k in scores) / sum(_COMPONENT_WEIGHTS.values()),
+        sum(scores[k] * _COMPONENT_WEIGHTS[k] for k in scores) / sum(_COMPONENT_WEIGHTS.values())
+        - AUDIO_SYNTHETIC_OFFSET,
         0, 100
     ))
     R.payload['stage_scores']['audio_forensics'] = round(forensic_prob, 1)
