@@ -1,6 +1,6 @@
 """
 Image analysis pipeline  -  five-stage fusion architecture:
-  Stage 1: frequency_domain_analysis()    -  FFT/spectral forensics 
+  Stage 1: frequency_domain_analysis()    -  FFT/spectral forensics
   Stage 2: face_forensic_analysis()       -  face/region forensics (human faces only)
   Stage 3: manipulation_analysis()        -  ELA, copy-move, PRNU, metadata, patch analysis
   Stage 4: vehicle_damage_analysis()      -  vehicle/object damage forensics (runs when no human face)
@@ -178,8 +178,34 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     apply_graph_style()
 
     indicators = []
-    suspicion  = 0
-    MAX_TESTS  = 7
+    # BUG FIX (19 Aug 2026): this used to be a manually-incremented
+    # `suspicion` counter against a hardcoded `MAX_TESTS = 7`, but the
+    # function only ever ran 6 actual tests (hf_std, high_e, spec_entropy,
+    # sym_diff_tb, residual_std, edge_density) - confirmed by grepping
+    # every `suspicion += 1` site in this function. That mismatch meant
+    # freq_score could never reach 100% even when every real test fired
+    # (6/7 = 85.7% was the true ceiling), and silently compressed every
+    # score by a fixed 6/7 ratio system-wide - frequency feeds ai_gen_
+    # composite in every content bucket (15% weight for VEHICLE, 30% for
+    # FACE), so this wasn't vehicle-specific.
+    #
+    # Confirmed via real batch data (19 Aug 2026, 3 vehicle batches, 180
+    # images): backing out the integer test-count from each image's
+    # already-computed freq_score and rescaling against the correct
+    # denominator is a pure, monotonic rescale - no image's relative
+    # ranking changes, only the absolute number (e.g. REAL batch mean
+    # 26.2 -> 30.6, MJ-fake batch mean 18.6 -> 21.7). This does NOT fix
+    # frequency's weak discrimination between real and AI-generated
+    # vehicle content on its own - that's a separate, deeper limitation
+    # (a 6-flag counting heuristic only ever has 7 possible output values,
+    # by construction, regardless of the denominator) - it only corrects
+    # the arithmetic once a test fires.
+    #
+    # Refactored to a list of booleans rather than patching the literal 7
+    # -> 6, specifically so MAX_TESTS is *derived* from the real test
+    # count and can't silently drift out of sync again if a test is ever
+    # added or removed here without updating a constant somewhere else.
+    tests_fired = []
 
     orig_w, orig_h = pil_image.size
     megapixels     = (orig_w * orig_h) / 1_000_000
@@ -255,19 +281,23 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     plt.close(fig)
 
     if hf_std < 0.1:
-        indicators.append('Flattened high-frequency spectrum'); suspicion += 1
+        indicators.append('Flattened high-frequency spectrum')
+    tests_fired.append(hf_std < 0.1)
     if high_e < low_e * 0.1:
-        indicators.append('Weak high-frequency energy'); suspicion += 1
+        indicators.append('Weak high-frequency energy')
+    tests_fired.append(high_e < low_e * 0.1)
 
     norm_lp      = log_power / (np.sum(log_power) + 1e-12)
     spec_entropy = float(-np.sum(norm_lp * np.log2(norm_lp + 1e-12)))
     R.add_stat('Spectral Entropy', f'{spec_entropy:.2f}')
     if spec_entropy < 15:
-        indicators.append(f'Low spectral entropy ({spec_entropy:.2f})'); suspicion += 1
+        indicators.append(f'Low spectral entropy ({spec_entropy:.2f})')
+    tests_fired.append(spec_entropy < 15)
 
     sym_diff_tb = float(np.mean(np.abs(log_power - np.flipud(log_power))))
     if sym_diff_tb < 0.5:
-        indicators.append('Abnormal top-bottom spectrum symmetry'); suspicion += 1
+        indicators.append('Abnormal top-bottom spectrum symmetry')
+    tests_fired.append(sym_diff_tb < 0.5)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     for i, (ch_name, ax) in enumerate(zip(['Red', 'Green', 'Blue'], axes)):
@@ -294,7 +324,8 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     plt.close(fig)
 
     if residual_std < 4:
-        indicators.append('Extremely weak sensor-noise residual'); suspicion += 1
+        indicators.append('Extremely weak sensor-noise residual')
+    tests_fired.append(residual_std < 4)
 
     edge_map     = cv2.Canny(gray_array, 100, 200)
     edge_density = float(np.mean(edge_map > 0))
@@ -308,8 +339,11 @@ def frequency_domain_analysis(filepath, pil_image, R: AnalysisResult):
     plt.close(fig)
 
     if edge_density < edge_thresh:
-        indicators.append(f'Unusually low edge density ({edge_density:.4f})'); suspicion += 1
+        indicators.append(f'Unusually low edge density ({edge_density:.4f})')
+    tests_fired.append(edge_density < edge_thresh)
 
+    suspicion  = sum(tests_fired)
+    MAX_TESTS  = len(tests_fired)  # derived, not hardcoded - see comment above tests_fired's definition
     freq_score = float(np.clip((suspicion / MAX_TESTS) * 100, 0, 100))
     R.add_stat('Frequency Suspicion', f'{suspicion}/{MAX_TESTS}')
     R.add_stat('Frequency Score',     f'{freq_score:.1f}%')
