@@ -20,9 +20,60 @@ from fastapi import UploadFile, HTTPException, Request
 CHUNK_SIZE = 1024 * 1024  # 1MB — small enough to bound memory, large enough to not be slow
 
 ALLOWED_MIME_TYPES = {
+    # IMAGE - matches config.py's IMAGE_FORMATS
     "image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff",
-    # extend here once video/audio/document pipelines are audited and wired up
+
+    # AUDIO - matches config.py's AUDIO_FORMATS ({.mp3, .wav, .aac, .flac, .ogg, .m4a})
+    # BUG FIX (26 Aug 2026): this allowlist was image-only - the comment
+    # below said "extend here once video/audio/document pipelines are
+    # audited and wired up", but audio_pipeline.py/video_pipeline.py/
+    # document_pipeline.py were already live and dispatched to from
+    # pipeline.py. Every non-image upload was being rejected with a 415
+    # before ever reaching the detector package - confirmed live: a
+    # genuinely valid WAV file (RIFF/WAVE, PCM 16-bit stereo, verified
+    # with `file` against the actual header bytes, not just the
+    # extension) was rejected in production. Same root cause as main.py's
+    # hardcoded modality='image' - the API layer was never updated to
+    # match what the pipeline layer already supported.
+    "audio/mpeg",                # .mp3
+    "audio/x-wav", "audio/wav",  # .wav - libmagic reports either depending on version; both included
+    "audio/aac", "audio/x-hx-aac-adts",  # .aac - container-dependent detection
+    "audio/x-flac", "audio/flac",        # .flac - libmagic reports either depending on version
+    "audio/ogg",                 # .ogg
+    "audio/mp4", "audio/x-m4a",  # .m4a - MP4-container audio, detection varies
+
+    # VIDEO - matches config.py's VIDEO_FORMATS
+    "video/mp4",
+    "video/x-msvideo",   # .avi
+    "video/quicktime",   # .mov
+    "video/x-matroska",  # .mkv
+    "video/x-flv",       # .flv
+    "video/webm",
+    "video/x-ms-wmv",    # .wmv
+
+    # DOCUMENT - matches config.py's DOCUMENT_FORMATS
+    "text/plain",         # .txt, .md (markdown has no distinct binary signature)
+    "application/pdf",
+    "application/msword", # .doc
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "application/zip",    # .docx is a zip container - some libmagic versions/builds report this
+                           # instead of the docx-specific MIME above; included so a valid .docx
+                           # isn't rejected on a build that detects it this way
+    "text/rtf", "application/rtf",  # .rtf - libmagic reports either depending on version
 }
+
+# CAVEAT (26 Aug 2026): the audio/video/document MIME strings above are
+# standard/commonly-documented libmagic output for these formats. One was
+# directly verified, not just documented: audio/x-wav was confirmed by
+# running magic.from_buffer() against the exact real file that produced
+# the production 415 (a genuine RIFF/WAVE PCM file) - it detected as
+# audio/x-wav precisely, confirming this fix resolves that real case. The
+# rest (other audio formats, video, document) were not individually
+# tested against real files in this environment. If a valid upload of a
+# supported format still gets rejected, the error response's own detail
+# field states exactly what was detected (see the 415 raise below) -
+# check Render's logs for that specific string and add it here rather
+# than guessing further.
 
 
 async def validate_upload(file: UploadFile, max_bytes: int, request: Request = None) -> bytes:
