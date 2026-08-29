@@ -162,7 +162,13 @@ async def signup(body: SignupRequest):
             body.email, password_hash,
         )
         await conn.execute(
-            "INSERT INTO subscriptions (user_id, plan, monthly_quota) VALUES ($1, 'free', 20)",
+            # BUG FIX (27 Aug 2026): was 20 - inconsistent with billing.py's
+            # subscription-cancellation handler, which reverts a canceled
+            # subscription to 'free' with monthly_quota=200. Same plan tier
+            # was getting two different quotas depending on which code path
+            # assigned it - confirmed 200 is the correct value, this was the
+            # stale one.
+            "INSERT INTO subscriptions (user_id, plan, monthly_quota) VALUES ($1, 'free', 200)",
             row["id"],
         )
 
