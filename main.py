@@ -25,7 +25,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
 
-from detector.config import TMP_FOLDER, REPORT_FOLDER, MAX_UPLOAD_BYTES, ALLOWED_ORIGINS
+from detector.config import (
+    TMP_FOLDER, REPORT_FOLDER, MAX_UPLOAD_BYTES, ALLOWED_ORIGINS,
+    IMAGE_FORMATS, VIDEO_FORMATS, AUDIO_FORMATS, DOCUMENT_FORMATS,
+)
 from detector.pipeline import run_pipeline
 
 from db import init_db_pool, close_db_pool, get_pool
@@ -91,6 +94,42 @@ async def _run_pipeline_and_cleanup(tmp_path: str, job_id: str):
             pass
 
 
+def _detect_modality(filename: str) -> str:
+    """
+    BUG FIX (27 Aug 2026): modality was hardcoded 'image' for every /analyze
+    call below, regardless of what was actually uploaded - confirmed by
+    reading this file directly, both create_job() and record_usage() used
+    the literal string 'image' unconditionally. Every audio/video/document
+    job has been recorded in the database as modality='image' since this
+    endpoint was written.
+    This does NOT affect the analysis itself - pipeline.py does its own,
+    correct, independent extension-based file_type detection regardless of
+    what main.py records here. It only affects what gets RECORDED for a
+    job (billing/usage/analytics), which has been silently wrong for every
+    non-image upload.
+    Deliberately mirrors pipeline.py's own file_type detection (same
+    config.py format sets, same extension-based logic, just lowercased to
+    match this endpoint's existing 'image' string convention) rather than
+    reimplementing separately - so the recorded modality can't drift out
+    of sync with what the pipeline actually processes the file as.
+    'unknown' is a safe fallback for an unrecognized extension - pipeline.py
+    itself doesn't reject these upfront (they complete as a job with an
+    error field, not a crash - see run_pipeline()'s UNSUPPORTED branch), so
+    this needs a value that won't itself raise if create_job()/record_usage()
+    have a strict allowed-value check. NOT independently confirmed against
+    jobs.py/db.py's actual schema (neither has been reviewed this session) -
+    if either has a DB-level constraint on allowed modality values, confirm
+    'video'/'audio'/'document'/'unknown' are all accepted before relying on
+    this in production, same as any other unverified downstream contract.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    if   ext in IMAGE_FORMATS    : return 'image'
+    elif ext in VIDEO_FORMATS    : return 'video'
+    elif ext in AUDIO_FORMATS    : return 'audio'
+    elif ext in DOCUMENT_FORMATS : return 'document'
+    else                         : return 'unknown'
+
+
 @app.post('/analyze')
 @limiter.limit(ANALYZE_PER_MINUTE)
 async def analyze_file(
@@ -110,14 +149,15 @@ async def analyze_file(
     safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', file.filename or 'upload')
     job_id    = hashlib.md5(f'{safe_name}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]
     tmp_path  = os.path.join(TMP_FOLDER, f'{job_id}_{safe_name}')
+    modality  = _detect_modality(safe_name)
 
     with open(tmp_path, 'wb') as f:
         f.write(contents)
 
-    print(f'\n[{job_id}] Received: {safe_name} ({len(contents):,} bytes)  |  user: {user["email"]}')
+    print(f'\n[{job_id}] Received: {safe_name} ({len(contents):,} bytes)  |  user: {user["email"]}  |  modality: {modality}')
 
-    await create_job(job_id, user['id'], modality='image', safe_name=safe_name)
-    await record_usage(user['id'], job_id, '/analyze', 'image')
+    await create_job(job_id, user['id'], modality=modality, safe_name=safe_name)
+    await record_usage(user['id'], job_id, '/analyze', modality)
 
     background_tasks.add_task(run_job, job_id, _run_pipeline_and_cleanup, tmp_path, job_id)
 
