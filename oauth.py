@@ -97,7 +97,9 @@ async def _find_or_create_oauth_user(provider: str, provider_user_id: str, email
             email,
         )
         await conn.execute(
-            "INSERT INTO subscriptions (user_id, plan, monthly_quota) VALUES ($1, 'free', 20)",
+            # BUG FIX (27 Aug 2026): same fix as auth.py's signup() - was 20,
+            # inconsistent with billing.py's cancellation handler (200).
+            "INSERT INTO subscriptions (user_id, plan, monthly_quota) VALUES ($1, 'free', 200)",
             new_user["id"],
         )
         await conn.execute(
