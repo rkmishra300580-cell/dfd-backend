@@ -83,7 +83,23 @@ def _extract_clip_embedding(pil_image) -> np.ndarray:
         inputs = processor(images=pil_image.convert('RGB'), return_tensors='pt').to(device)
         with torch.no_grad():
             features = model.get_image_features(**inputs)
-        embedding = features.cpu().numpy().flatten()
+        # BUG FIX (26 Aug 2026): get_image_features() is documented to return
+        # a raw tensor, but was confirmed (Colab training run, real error:
+        # "'BaseModelOutputWithPooling' object has no attribute 'cpu'") to
+        # return a wrapped model-output object instead under the transformers
+        # version installed there - a version-compatibility difference, not
+        # a data problem (the error was identical across every failed file,
+        # not varying per-image the way a corrupt-file error would).
+        # Handles both shapes rather than assuming one, so this doesn't
+        # silently break again on a different transformers version either way.
+        if hasattr(features, 'cpu'):
+            embedding = features.cpu().numpy().flatten()
+        elif hasattr(features, 'image_embeds'):
+            embedding = features.image_embeds.cpu().numpy().flatten()
+        elif hasattr(features, 'pooler_output'):
+            embedding = features.pooler_output.cpu().numpy().flatten()
+        else:
+            raise TypeError(f'Unexpected return type from get_image_features(): {type(features)}')
     finally:
         del model, processor
         gc.collect()
