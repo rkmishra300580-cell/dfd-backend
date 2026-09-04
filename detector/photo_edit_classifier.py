@@ -119,7 +119,22 @@ def _extract_clip_embedding(pil_image) -> np.ndarray:
         inputs = processor(images=pil_image.convert('RGB'), return_tensors='pt').to(device)
         with torch.no_grad():
             features = model.get_image_features(**inputs)
-        embedding = features.cpu().numpy().flatten()
+        # BUG FIX (26 Aug 2026): same fix as vehicle_ai_gen_classifier.py -
+        # get_image_features() is documented to return a raw tensor, but was
+        # confirmed to return a wrapped model-output object instead under
+        # certain transformers versions ("'BaseModelOutputWithPooling' object
+        # has no attribute 'cpu'"). This file has never been run/trained yet,
+        # so the bug hadn't triggered here, but the code is identical to
+        # vehicle_ai_gen_classifier.py's - fixing proactively rather than
+        # waiting to hit the same crash whenever this classifier is first used.
+        if hasattr(features, 'cpu'):
+            embedding = features.cpu().numpy().flatten()
+        elif hasattr(features, 'image_embeds'):
+            embedding = features.image_embeds.cpu().numpy().flatten()
+        elif hasattr(features, 'pooler_output'):
+            embedding = features.pooler_output.cpu().numpy().flatten()
+        else:
+            raise TypeError(f'Unexpected return type from get_image_features(): {type(features)}')
     finally:
         del model, processor
         gc.collect()
@@ -172,6 +187,7 @@ def train_and_save(real_image_paths: list, ai_edited_image_paths: list,
     would be worse than refusing to train at all.
     """
     from sklearn.linear_model import LogisticRegression
+    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
     import joblib
@@ -211,10 +227,55 @@ def train_and_save(real_image_paths: list, ai_edited_image_paths: list,
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
-    clf = LogisticRegression(max_iter=1000, class_weight='balanced')
+    # CALIBRATION FIX applied proactively (28 Aug 2026) - not a theoretical
+    # precaution. face_ai_gen_classifier.py's bare LogisticRegression showed
+    # a real, reproducible pattern of confidently-wrong predictions across 3
+    # consecutive batches (max confidence on a WRONG prediction: 99.67%,
+    # 99.93%, 88.7%) before this exact fix was applied there. Applying it
+    # here from the start rather than waiting to rediscover the same
+    # problem - same reasoning: a bare LogisticRegression's predict_proba()
+    # isn't guaranteed to be calibrated, and this file's ai-edited-vs-real
+    # task is if anything a HARDER, more overlapping distinction than
+    # wholesale-AI-vs-real (see this module's own docstring on the CLIP-
+    # embedding architecture's suitability doubts for local-edit detection)
+    # - if anything, MORE risk of overconfident wrongness here, not less.
+    # method='sigmoid' (Platt scaling), not 'isotonic' - sklearn's own
+    # guidance is to prefer sigmoid below ~1,000 samples to avoid the
+    # calibration step itself overfitting.
+    # cv fold count capped by the smallest class's actual training size,
+    # not hardcoded - MIN_PER_CLASS only guarantees 10 images BEFORE the
+    # train/test split and BEFORE any embedding failures.
+    # score_photo_edit_domain() needs NO changes for this -
+    # CalibratedClassifierCV exposes the identical .predict_proba()/
+    # .classes_ interface a bare LogisticRegression does.
+    base_clf = LogisticRegression(max_iter=1000, class_weight='balanced')
+    min_class_count = min(np.bincount(np.unique(y_train, return_inverse=True)[1]))
+    cv_folds = max(2, min(5, min_class_count))
+    clf = CalibratedClassifierCV(base_clf, method='sigmoid', cv=cv_folds)
     clf.fit(X_train, y_train)
 
     y_pred = clf.predict(X_test)
+
+    # CALIBRATION CHECK - same as face_ai_gen_classifier.py: reports, for
+    # the held-out test set, per-file confidence (distance from 50/50,
+    # matching the deployed shape) split by correct vs incorrect
+    # predictions. Healthy pattern: incorrect predictions show LOWER
+    # confidence than correct ones (unsure when wrong, not confidently
+    # wrong). Red flag: incorrect predictions with confidence >= 80%.
+    proba_test = clf.predict_proba(X_test)
+    ai_edited_col = list(clf.classes_).index('AI_EDITED')
+    proba_ai_edited = proba_test[:, ai_edited_col]
+    per_file_confidence = np.abs(proba_ai_edited - 0.5) * 200
+    correct_mask = (y_pred == y_test)
+
+    calibration = {
+        'correct_confidence_mean':   float(per_file_confidence[correct_mask].mean()) if correct_mask.any() else None,
+        'correct_confidence_min':    float(per_file_confidence[correct_mask].min()) if correct_mask.any() else None,
+        'incorrect_confidence_mean': float(per_file_confidence[~correct_mask].mean()) if (~correct_mask).any() else None,
+        'incorrect_confidence_max':  float(per_file_confidence[~correct_mask].max()) if (~correct_mask).any() else None,
+        'n_incorrect_high_confidence': int(np.sum((~correct_mask) & (per_file_confidence >= 80))),
+    }
+
     metrics = {
         'accuracy':                float(accuracy_score(y_test, y_pred)),
         'confusion_matrix':        confusion_matrix(y_test, y_pred, labels=['REAL', 'AI_EDITED']).tolist(),
@@ -223,6 +284,7 @@ def train_and_save(real_image_paths: list, ai_edited_image_paths: list,
         'n_train':                 len(X_train),
         'n_test':                  len(X_test),
         'n_failed_embeddings':    len(failed),
+        'calibration':             calibration,
     }
 
     os.makedirs(_MODEL_DIR, exist_ok=True)
@@ -235,5 +297,16 @@ def train_and_save(real_image_paths: list, ai_edited_image_paths: list,
     print(f'Confusion matrix {metrics["confusion_matrix_labels"]}:')
     for row in metrics['confusion_matrix']:
         print(f'  {row}')
+
+    print(f'\nCalibration check (per-file confidence, correct vs incorrect predictions):')
+    if calibration['correct_confidence_mean'] is not None:
+        print(f'  Correct predictions   - mean confidence: {calibration["correct_confidence_mean"]:.1f}%  '
+              f'(min: {calibration["correct_confidence_min"]:.1f}%)')
+    if calibration['incorrect_confidence_mean'] is not None:
+        print(f'  Incorrect predictions - mean confidence: {calibration["incorrect_confidence_mean"]:.1f}%  '
+              f'(max: {calibration["incorrect_confidence_max"]:.1f}%)')
+        if calibration['n_incorrect_high_confidence'] > 0:
+            print(f'  \u26a0 FLAG: {calibration["n_incorrect_high_confidence"]} incorrect prediction(s) '
+                  f'had confidence >= 80% - confidently WRONG, not just wrong.')
 
     return metrics
