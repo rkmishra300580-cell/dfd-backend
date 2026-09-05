@@ -127,7 +127,22 @@ async def google_login():
         "response_type": "code",
         "scope": "openid email profile",
         "access_type": "online",
-        "prompt": "select_account",
+        # DIAGNOSTIC (5 Sep 2026): 'prompt': 'select_account' removed.
+        # Confirmed real login failures: reaching Google's account chooser
+        # successfully, but failing with a generic 401 "malformed request"
+        # specifically when rendering the CONSENT screen right after
+        # picking an account - not at the initial redirect. A known class
+        # of Google OAuth bug involves specific `prompt` values causing
+        # Google's own URL construction to drop client_id internally,
+        # producing exactly this symptom. Testing without it as the
+        # cheapest, most isolated change - Google's default behavior
+        # without an explicit prompt is still to show the account chooser
+        # when there are multiple sessions, so this shouldn't change the
+        # user-facing flow if it isn't the cause. If login starts working,
+        # this was it; if not, re-add and look elsewhere (OAuth consent
+        # screen's Branding tab - App name/support email/logo - is the
+        # next most likely candidate, since the failure point is
+        # specifically at consent-screen rendering, not the initial request).
         "state": _new_state(),
     }
     return RedirectResponse(url=f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}")
