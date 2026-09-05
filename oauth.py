@@ -6,7 +6,7 @@ is a plain backend, not a mobile/SPA-only PKCE flow).
 Flow for each provider, identical shape:
   1. Frontend does a full page navigation (NOT a fetch — this must be a real
      browser redirect) to GET /auth/{provider}/login
-  2. That redirects the browser to the provider's own consent screen
+  2. That redirects the brows er to the provider's own consent screen
   3. User approves -> provider redirects back to /auth/{provider}/callback?code=...&state=...
   4. Backend exchanges the code for an access token, fetches the user's
      profile, finds-or-creates a local user row, issues our own JWT, and
